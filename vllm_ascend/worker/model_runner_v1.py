@@ -2887,11 +2887,19 @@ class NPUModelRunner(GPUModelRunner):
 
         self._check_and_update_cudagraph_mode(attention_backend_list, kv_cache_config.kv_cache_groups)
 
-        for i, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
-            attn_backends = get_attn_backends_for_group(  # type: ignore
-                kv_cache_group_spec
-            )
-            self.attn_groups.append(create_attn_groups(attn_backends[0], i))
+        # Collect all attention backends and merge groups with the same backend + spec.
+        # This optimization reduces the number of AttentionGroup objects and metadata
+        # builders, which is beneficial for hybrid models like Qwen3.5 where vLLM
+        # splits linear attention layers into multiple kv_cache_groups for PP support.
+        # In non-PP scenarios, we can safely merge these groups to reduce overhead.
+        merged_attn_backends: dict[AttentionGroupKey, list[str]] = defaultdict(list)
+        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
+            attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
+            for group_key, layer_names in attn_backends[0].items():
+                merged_attn_backends[group_key].extend(layer_names)
+
+        # Create merged attention groups
+        self.attn_groups.append(create_attn_groups(merged_attn_backends, 0))
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()

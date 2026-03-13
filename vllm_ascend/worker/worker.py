@@ -95,12 +95,7 @@ class NPUWorker(WorkerBase):
         from vllm_ascend.utils import adapt_patch
 
         adapt_patch()
-        # Import _inductor for graph mode execution with triton
-        # This lazy import avoids torch_npu re-initialization in patch
-        from vllm.triton_utils import HAS_TRITON
 
-        if HAS_TRITON:
-            import torch_npu._inductor  # noqa: F401
         # Register ops when worker init.
         from vllm_ascend import ops
 
@@ -252,6 +247,15 @@ class NPUWorker(WorkerBase):
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
+
+        # Import _inductor for graph mode execution with triton
+        # This lazy import avoids torch_npu re-initialization in patch
+        # Note that this should be imported after torch.npu.set_device
+        # to avoid repeated set_device in extra processes
+        from vllm.triton_utils import HAS_TRITON
+
+        if HAS_TRITON:
+            import torch_npu._inductor  # noqa: F401
 
         gc.collect()
         torch.npu.empty_cache()
@@ -504,6 +508,7 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
@@ -575,7 +580,6 @@ class NPUWorker(WorkerBase):
             self.parallel_config.decode_context_parallel_size,
         )
         init_ascend_model_parallel(self.parallel_config)
-        ensure_kv_transfer_initialized(self.vllm_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
     def _create_profiler(self, trace_name: str):

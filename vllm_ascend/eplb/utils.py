@@ -16,8 +16,56 @@
 #
 # Todo: Once https://github.com/vllm-project/vllm/pull/23553 is merged in vllm. Remove this model register.
 import types
+from typing import Any
 
 import torch
+
+
+_MISSING = object()
+
+
+def get_model_arch_config(model: Any) -> Any:
+    config = getattr(model, "config", None)
+    if config is None:
+        raise AttributeError("model.config is required for EPLB.")
+
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        for kwargs in ({"decoder": True}, {}):
+            try:
+                text_config = get_text_config(**kwargs)
+            except TypeError:
+                continue
+            if text_config is not None:
+                config = text_config
+                break
+
+    while True:
+        text_config = getattr(config, "text_config", None)
+        if text_config is None or text_config is config:
+            break
+        config = text_config
+
+    return config
+
+
+def get_model_arch_attr(model: Any, attr_name: str, default: Any = _MISSING) -> Any:
+    for config in (get_model_arch_config(model), getattr(model, "config", None)):
+        if config is not None and hasattr(config, attr_name):
+            return getattr(config, attr_name)
+
+    if default is not _MISSING:
+        return default
+
+    raise AttributeError(f"Unable to resolve `{attr_name}` from model config for EPLB.")
+
+
+def get_num_dense_layers(model: Any) -> int:
+    return get_model_arch_attr(model, "first_k_dense_replace", 0)
+
+
+def get_num_hidden_layers(model: Any) -> int:
+    return get_model_arch_attr(model, "num_hidden_layers")
 
 
 def get_expert_map(self, layer_id):
@@ -29,8 +77,8 @@ def get_log2phy_map(self, layer_id):
 
 
 def get_all_moe_loads(self):
-    num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
-    num_layers = self.model.config.num_hidden_layers
+    num_dense_layers = get_num_dense_layers(self)
+    num_layers = get_num_hidden_layers(self)
     all_moe_loads = torch.stack(
         [self.model.layers[layer_id].mlp.experts.moe_load for layer_id in range(num_dense_layers, num_layers)],
         dim=0,
@@ -39,8 +87,8 @@ def get_all_moe_loads(self):
 
 
 def clear_all_moe_loads(self):
-    num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
-    num_layers = self.model.config.num_hidden_layers
+    num_dense_layers = get_num_dense_layers(self)
+    num_layers = get_num_hidden_layers(self)
     for layer_id in range(num_dense_layers, num_layers):
         self.model.layers[layer_id].mlp.experts.clear_moe_load()
 

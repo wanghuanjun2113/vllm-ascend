@@ -23,6 +23,7 @@ import torch.distributed as dist
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.eplb.utils import get_num_dense_layers, get_num_hidden_layers
 from vllm_ascend.quantization.methods.base import QuantType
 
 
@@ -32,8 +33,9 @@ class VllmEplbAdaptor:
         self.model = model
         self.rank_id = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
-        self.num_moe_layers = self.model.config.num_hidden_layers - self.num_dense_layers
+        self.num_dense_layers = get_num_dense_layers(self.model)
+        self.num_hidden_layers = get_num_hidden_layers(self.model)
+        self.num_moe_layers = self.num_hidden_layers - self.num_dense_layers
 
         self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
 
@@ -78,7 +80,7 @@ class VllmEplbAdaptor:
         else:
             self.expert_weight_names = ["w13_weight", "w2_weight"]
 
-        for layer_idx in range(self.num_dense_layers, self.model.config.num_hidden_layers):
+        for layer_idx in range(self.num_dense_layers, self.num_hidden_layers):
             self.expert_param_per_layer[layer_idx] = list()
             for name in self.expert_weight_names:
                 param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"

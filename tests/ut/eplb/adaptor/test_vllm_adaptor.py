@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -32,6 +33,17 @@ class TestVllmAdaptor(unittest.TestCase):
     @patch("torch.empty_like", return_value=torch.zeros(16, 32))
     def test_init_w8a8(self, mock_func):
         VllmEplbAdaptor(self.model)
+
+    @patch("torch.empty_like", return_value=torch.zeros(16, 32))
+    def test_init_with_nested_text_config(self, mock_func):
+        nested_config = DeepseekV2Config(n_routed_experts=256)
+        self.model.config = SimpleNamespace(text_config=nested_config)
+        self.model.model.layers[getattr(nested_config, "first_k_dense_replace", 0)].mlp.experts.quant_type = QuantType.W8A8
+
+        adaptor = VllmEplbAdaptor(self.model)
+
+        self.assertEqual(adaptor.num_dense_layers, getattr(nested_config, "first_k_dense_replace", 0))
+        self.assertEqual(adaptor.num_hidden_layers, nested_config.num_hidden_layers)
 
     def tearDown(self):
         self.mock_rank.stop()

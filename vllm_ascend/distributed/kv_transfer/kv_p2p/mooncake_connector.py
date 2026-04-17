@@ -125,6 +125,19 @@ class KVCacheTaskTracker:
         # be force-freed.
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.reqs_to_process: set[str] = set()
+        self._delayed_monitor_thread = threading.Thread(
+            target=self._monitor_delayed_requests, daemon=True)
+        self._delayed_monitor_thread.start()
+
+    def _monitor_delayed_requests(self):
+        while True:
+            time.sleep(5)
+            with self.done_task_lock:
+                if self.delayed_free_requests:
+                    logger.info(
+                        "Delayed free requests: count=%d, requests=%s",
+                        len(self.delayed_free_requests),
+                        list(self.delayed_free_requests.keys()))
 
     def add_req_to_process(self, request_id: str):
         self.reqs_to_process.add(request_id)

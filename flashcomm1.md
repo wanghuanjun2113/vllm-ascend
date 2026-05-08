@@ -1,186 +1,186 @@
-# FlashComm1 Design Notes
+# FlashComm1 设计说明
 
-## Overview
+## 概述
 
-FlashComm1, also called FC1 in vLLM Ascend code, is an Ascend-specific communication optimization for tensor parallel inference. Its main idea is to change the layer-to-layer hidden state layout from full sequence on every rank to sequence-sharded hidden states:
+FlashComm1 在 vLLM Ascend 代码中通常简称为 FC1，是面向 Ascend NPU 张量并行推理的通信优化。它的核心思想是：把层与层之间的 hidden states 从“每个 TP rank 都保存完整 sequence”改成“每个 TP rank 只保存 sequence 维的一段”。
 
 ```text
-Without FC1:
-  each TP rank keeps [S, H]
+不开 FC1:
+  每个 TP rank 保存 [S, H]
 
-With FC1 and TP = N:
-  each TP rank keeps [S / N, H] between layers
+开启 FC1，TP = N:
+  层间每个 TP rank 保存 [S / N, H]
 ```
 
-For Dense models, FC1 replaces many row-parallel `all_reduce` boundaries with `reduce_scatter`, then performs `all_gather` only before column-parallel layers that need full sequence input. For MoE models, FC1 keeps the same sequence-sharded layer boundary, but the FFN part is handled through routed expert dispatch and combine instead of Dense `gate_up_proj/down_proj`.
+对 Dense 模型来说，FC1 会把很多 row-parallel 边界上的 `all_reduce` 改成 `reduce_scatter`，并且只在 column-parallel 层真正需要完整 sequence 输入之前再做 `all_gather`。对 MoE 模型来说，FC1 仍然维持 sequence-sharded 的层间 hidden states，但 FFN 部分由 routed experts 的 dispatch/combine 完成，而不是 Dense 模型里的 `gate_up_proj/down_proj`。
 
-The feature is enabled by:
+启用方式：
 
 ```bash
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 ```
 
-The legacy environment variable `VLLM_ASCEND_ENABLE_FLASHCOMM=1` is still accepted for compatibility.
+为了兼容旧配置，`VLLM_ASCEND_ENABLE_FLASHCOMM=1` 也仍然会被识别。
 
-## Enable Logic
+## 生效逻辑
 
-The runtime flag is stored in `forward_context.flash_comm_v1_enabled`.
+运行时是否启用 FC1 记录在 `forward_context.flash_comm_v1_enabled` 中。
 
-For Dense main models:
+Dense 主模型：
 
 ```text
 flash_comm_v1_enabled =
   enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
 ```
 
-For MoE main models:
+MoE 主模型：
 
 ```text
 flash_comm_v1_enabled =
   enable_sp(vllm_config) and num_tokens is not None
 ```
 
-The Dense path has a token threshold because FC1 adds collective communication boundaries. For small decode batches, the fixed communication overhead can exceed the saved computation and memory traffic.
+Dense 路径有 `num_tokens > 1000` 的阈值，是因为 FC1 会引入额外的集合通信边界。小 batch 或 decode 阶段 token 数很少时，通信固定开销可能超过节省下来的计算和访存收益。
 
-When FC1 is enabled, the context also records:
+FC1 开启后，forward context 中还会记录这些关键状态：
 
 ```text
-pad_size: pad token count to a multiple of TP size
-mmrs_fusion: enable Matmul + ReduceScatter fusion for supported Dense row-parallel layers
-padded_num_tokens: padded token count used by MC2 and related MoE paths
-mc2_mask: active-token mask for padded MoE communication
+pad_size: 将 token 数 pad 到 TP size 的倍数
+mmrs_fusion: 是否为支持的 Dense row-parallel 层启用 Matmul + ReduceScatter 融合
+padded_num_tokens: MC2 和相关 MoE 路径使用的 padded token 数
+mc2_mask: MoE padded token 的有效 token mask
 ```
 
-## Dense Model Flow
+## Dense 模型流程
 
-Use Qwen3.5-27B TP4 as an example:
+以下用 Qwen3.5-27B TP4 举例：
 
 ```text
 S = 4096
 TP = 4
 intermediate_size = 17408
-per-rank sequence shard = 1024 tokens
+每个 rank 的 sequence shard = 1024 tokens
 ```
 
-### Without FC1
+### 不开启 FC1
 
 ```mermaid
 flowchart LR
-    A["hidden<br/>per rank: [4096,H]"]
+    A["hidden<br/>每 rank: [4096,H]"]
     A --> B["Attn RMSNorm<br/>[4096,H]"]
     B --> C["qkv_proj<br/>Column Parallel<br/>[4096,H] -> QKV shard"]
-    C --> D["Attention<br/>simplified"]
-    D --> E["o_proj<br/>Row Parallel<br/>local output [4096,H]"]
+    C --> D["Attention<br/>简略表示"]
+    D --> E["o_proj<br/>Row Parallel<br/>局部输出 [4096,H]"]
     E --> F["AllReduce"]
-    F --> G["attn output<br/>per rank: [4096,H]"]
+    F --> G["Attention 后 hidden<br/>每 rank: [4096,H]"]
 
     G --> H["FFN RMSNorm<br/>[4096,H]"]
     H --> I["gate_up_proj<br/>Column Parallel<br/>[4096,H] -> [4096,2*17408/4]"]
     I --> J["SwiGLU / Activation<br/>[4096,17408/4]"]
-    J --> K["down_proj<br/>Row Parallel<br/>local output [4096,H]"]
+    J --> K["down_proj<br/>Row Parallel<br/>局部输出 [4096,H]"]
     K --> L["AllReduce"]
-    L --> M["next layer hidden<br/>per rank: [4096,H]"]
+    L --> M["下一层 hidden<br/>每 rank: [4096,H]"]
 ```
 
-Each rank always has full sequence hidden states. RMSNorm, residual processing, and activation-side memory traffic are repeated on all TP ranks for all tokens.
+不开 FC1 时，每个 rank 始终持有完整 sequence。RMSNorm、residual 处理和 activation 相关的访存都会在所有 TP rank 上对完整 token 重复执行。
 
-### With FC1
+### 开启 FC1
 
 ```mermaid
 flowchart LR
-    A["hidden<br/>layer boundary per rank: [1024,H]"]
-    A --> B["Attn RMSNorm<br/>only [1024,H]"]
+    A["hidden<br/>层间每 rank: [1024,H]"]
+    A --> B["Attn RMSNorm<br/>只处理 [1024,H]"]
     B --> C["AllGather<br/>[1024,H] x 4 -> [4096,H]"]
     C --> D["qkv_proj<br/>Column Parallel<br/>[4096,H] -> QKV shard"]
-    D --> E["Attention<br/>simplified"]
-    E --> F["o_proj<br/>Row Parallel<br/>local output [4096,H]"]
-    F --> G["ReduceScatter<br/>or Matmul+ReduceScatter"]
-    G --> H["attn output<br/>per rank: [1024,H]"]
+    D --> E["Attention<br/>简略表示"]
+    E --> F["o_proj<br/>Row Parallel<br/>局部输出 [4096,H]"]
+    F --> G["ReduceScatter<br/>或 Matmul+ReduceScatter"]
+    G --> H["Attention 后 hidden<br/>每 rank: [1024,H]"]
 
-    H --> I["FFN RMSNorm<br/>only [1024,H]"]
+    H --> I["FFN RMSNorm<br/>只处理 [1024,H]"]
     I --> J["AllGather<br/>[1024,H] x 4 -> [4096,H]"]
     J --> K["gate_up_proj<br/>Column Parallel<br/>[4096,H] -> [4096,2*17408/4]"]
     K --> L["SwiGLU / Activation<br/>[4096,17408/4]"]
-    L --> M["down_proj<br/>Row Parallel<br/>local output [4096,H]"]
-    M --> N["ReduceScatter<br/>or Matmul+ReduceScatter"]
-    N --> O["next layer hidden<br/>per rank: [1024,H]"]
+    L --> M["down_proj<br/>Row Parallel<br/>局部输出 [4096,H]"]
+    M --> N["ReduceScatter<br/>或 Matmul+ReduceScatter"]
+    N --> O["下一层 hidden<br/>每 rank: [1024,H]"]
 ```
 
-The key difference is the layer boundary:
+两条路径的关键差异是层间 hidden states 的形态：
 
 ```text
-Without FC1:
-  o_proj/down_proj -> all_reduce -> each rank has [S, H]
+不开 FC1:
+  o_proj/down_proj -> all_reduce -> 每个 rank 都得到 [S, H]
 
-With FC1:
-  o_proj/down_proj -> reduce_scatter -> each rank has [S / TP, H]
-  before qkv_proj/gate_up_proj -> all_gather -> each rank temporarily has [S, H]
+开启 FC1:
+  o_proj/down_proj -> reduce_scatter -> 每个 rank 得到 [S / TP, H]
+  qkv_proj/gate_up_proj 前 -> all_gather -> 每个 rank 临时恢复 [S, H]
 ```
 
-`gate_up_proj` is usually a merged column-parallel projection. For Qwen3.5-27B:
+`gate_up_proj` 通常是 merged column-parallel projection。对 Qwen3.5-27B 来说：
 
 ```text
-gate_up_proj output per rank:
+gate_up_proj 每 rank 输出:
   [4096, 2 * 17408 / 4] = [4096, 8704]
 
-after SwiGLU:
+SwiGLU 后:
   [4096, 17408 / 4] = [4096, 4352]
 
-down_proj local output:
+down_proj 每 rank 局部输出:
   [4096, H]
 ```
 
-FC1 changes the communication after `down_proj` from `all_reduce` to `reduce_scatter`, so the next layer starts from `[1024, H]` on each rank.
+FC1 改变的是 `down_proj` 后的通信方式：从 `all_reduce` 改成 `reduce_scatter`，所以下一层开始时每个 rank 只持有 `[1024, H]`。
 
-## Dense Benefit Sources
+## Dense 场景收益来源
 
-### 1. Less RMSNorm and residual work
+### 1. RMSNorm 和 residual 处理量减少
 
-Dense transformer blocks usually have two RMSNorm or AddRMSNorm boundaries. Without FC1, every TP rank processes full `[S, H]`. With TP4 FC1, every rank processes only `[S / 4, H]` between row-parallel and column-parallel layers.
+Dense transformer block 中通常有两次 RMSNorm 或 AddRMSNorm。不开 FC1 时，每个 TP rank 都处理完整 `[S, H]`。TP4 开启 FC1 后，row-parallel 和 column-parallel 层之间每个 rank 只处理 `[S / 4, H]`。
 
-For `S = 4096`:
+以 `S = 4096` 为例：
 
 ```text
-Without FC1 per-rank norm input:
+不开 FC1，每 rank norm 输入:
   [4096, H]
 
-With FC1 per-rank norm input:
+开启 FC1，每 rank norm 输入:
   [1024, H]
 ```
 
-### 2. Less layer-boundary activation traffic
+### 2. 层间 activation 访存降低
 
-Layer-boundary hidden states and residual tensors are sequence-sharded:
+层间 hidden states 和 residual tensor 会按 sequence 维切分：
 
 ```text
-Without FC1:
-  hidden/residual per rank: [4096, H]
+不开 FC1:
+  hidden/residual 每 rank: [4096, H]
 
-With FC1:
-  hidden/residual per rank: [1024, H]
+开启 FC1:
+  hidden/residual 每 rank: [1024, H]
 ```
 
-This reduces activation memory footprint and memory bandwidth pressure in large prefill batches.
+这会降低大 batch prefill 场景下的 activation 显存占用和内存带宽压力。
 
-### 3. Better communication position for quantized models
+### 3. 量化场景下通信位置更有利
 
-The intended sequence is:
+理想的数据流是：
 
 ```text
 reduce_scatter -> RMSNorm -> Quant -> all_gather
 ```
 
-When quantization is available before all-gather, communication can move fewer bytes, for example INT8 instead of BF16.
+如果 all-gather 前已经完成量化，通信传输的数据量就可能更小。例如传 INT8 而不是 BF16，通信字节数可以明显下降。
 
-### 4. Matmul + ReduceScatter fusion
+### 4. Matmul + ReduceScatter 融合
 
-For supported Dense row-parallel layers, FC1 can fuse local matmul and reduce-scatter with:
+对支持的 Dense row-parallel 层，FC1 可以使用下面的融合算子把 local matmul 和 reduce-scatter 融合起来：
 
 ```python
 torch_npu.npu_mm_reduce_scatter_base(...)
 ```
 
-This is used in `SequenceRowParallelOp.matmul_and_reduce()` for layers such as:
+该逻辑在 `SequenceRowParallelOp.matmul_and_reduce()` 中使用，典型层包括：
 
 ```text
 o_proj
@@ -189,96 +189,96 @@ down_proj
 attention.dense
 ```
 
-Supported fusion paths:
+融合算子支持情况：
 
 ```text
 UnquantizedLinearMethod:
-  supported by npu_mm_reduce_scatter_base
+  支持 npu_mm_reduce_scatter_base
 
 Ascend W8A8:
-  supported by quantize + npu_mm_reduce_scatter_base
+  支持 quantize + npu_mm_reduce_scatter_base
 
-Other quantization methods:
-  keep FC1 reduce_scatter semantics but fall back to matmul followed by reduce_scatter
+其他量化方法:
+  保留 FC1 的 reduce_scatter 语义，但退化为 matmul 后再 reduce_scatter
 ```
 
-For unsupported cases, the implementation falls back to:
+不满足融合条件时，执行路径会退化为：
 
 ```text
 quant_method.apply(...)
 tensor_model_parallel_reduce_scatter(...)
 ```
 
-## MoE Model Flow
+## MoE 模型流程
 
-In MoE models, FC1 still keeps layer boundaries sequence-sharded, but the FFN block is routed expert computation instead of Dense `gate_up_proj/down_proj`.
+MoE 模型中，FC1 仍然保持层间 hidden states 按 sequence 维切分，但 FFN block 变成 routed expert computation，不再是 Dense 的 `gate_up_proj/down_proj`。
 
-### Without FC1
+### 不开启 FC1
 
 ```text
-hidden per rank: [S, H]
+hidden 每 rank: [S, H]
 
 Attention:
   qkv / attention / o_proj
   o_proj -> all_reduce
-  output per rank: [S, H]
+  输出每 rank: [S, H]
 
 MoE:
-  RMSNorm over [S, H]
-  router/topk over [S, num_experts]
-  token dispatch to expert ranks
-  local expert grouped matmul
-  token combine to original token order
-  output per rank: [S, H]
+  RMSNorm 处理 [S, H]
+  router/topk 处理 [S, num_experts]
+  token dispatch 到 expert 所在 rank
+  本地 expert grouped matmul
+  token combine 恢复原 token 顺序
+  输出每 rank: [S, H]
 ```
 
-### With FC1
+### 开启 FC1
 
 ```text
-hidden layer boundary per rank: [S / TP, H]
+层间 hidden 每 rank: [S / TP, H]
 
 Attention:
-  RMSNorm on local sequence shard
-  all_gather before qkv when needed
+  RMSNorm 只处理本地 sequence shard
+  qkv 前按需 all_gather
   o_proj -> reduce_scatter
-  output per rank: [S / TP, H]
+  输出每 rank: [S / TP, H]
 
 MoE:
-  RMSNorm on [S / TP, H]
-  router/topk only for local token shard
-  MoE prepare pads/slices and builds mc2_mask if needed
-  token dispatch sends routed tokens to expert ranks
-  local expert grouped matmul
-  token combine merges expert outputs
-  finalize keeps or restores the FC1 sequence-sharded boundary
+  RMSNorm 处理 [S / TP, H]
+  router/topk 只处理本地 token shard
+  MoE prepare 执行 pad/slice，并在需要时构造 mc2_mask
+  token dispatch 将 routed tokens 发送到 expert rank
+  本地 expert grouped matmul
+  token combine 合并 expert 输出
+  finalize 保持或恢复 FC1 的 sequence-sharded 层间形态
 ```
 
-Compared with Dense FC1, MoE FC1 usually should not restore full `[S, H]` before the FFN. Each TP rank routes its local token shard, and MoE communication handles expert placement.
+和 Dense FC1 相比，MoE FC1 通常不应该在 FFN 前恢复完整 `[S, H]`。每个 TP rank 只路由自己那一段 token，expert 的放置和 token 移动由 MoE 通信机制处理。
 
-## MC2 Compared With FC1
+## MC2 与 FC1 的区别
 
-MC2 is a separate MoE communication optimization. It is selected through `MoECommType` and is not used for Dense-only models.
+MC2 是另一类 MoE 通信优化。它通过 `MoECommType` 选择，并且不会用于 Dense-only 模型。
 
 ```text
 if not is_moe_model(vllm_config):
   moe_comm_type = None
 ```
 
-The conceptual difference is:
+两者的概念差异如下：
 
 ```text
 FC1:
-  Optimizes tensor-parallel layer boundaries.
-  Changes all_reduce into reduce_scatter + delayed all_gather.
-  Keeps layer hidden states sequence-sharded.
+  优化 tensor-parallel 的层间通信边界。
+  将 all_reduce 改成 reduce_scatter + 延迟 all_gather。
+  让层间 hidden states 保持 sequence-sharded。
 
 MC2:
-  Optimizes MoE token routing.
-  Uses Ascend dispatch/combine operators to send tokens to expert ranks
-  and combine expert outputs.
+  优化 MoE token routing。
+  使用 Ascend dispatch/combine 算子把 token 发送到 expert rank，
+  再把 expert 输出合并回来。
 ```
 
-MC2 core operators:
+MC2 核心算子：
 
 ```text
 torch_npu.npu_moe_distribute_dispatch
@@ -287,7 +287,7 @@ torch_npu.npu_moe_distribute_combine
 torch_npu.npu_moe_distribute_combine_v2
 ```
 
-Fused MC2 can further replace the full dispatch, expert MLP, and combine pipeline:
+Fused MC2 可以进一步替换完整的 dispatch、expert MLP 和 combine 流程：
 
 ```text
 VLLM_ASCEND_ENABLE_FUSED_MC2=1:
@@ -297,28 +297,28 @@ VLLM_ASCEND_ENABLE_FUSED_MC2=2:
   dispatch_gmm_combine_decode
 ```
 
-| Aspect | FC1 | MC2 |
+| 维度 | FC1 | MC2 |
 | --- | --- | --- |
-| Main target | TP Dense and layer-boundary communication | MoE routed expert communication |
-| Model scope | Dense and MoE | MoE only |
-| Communication group | TP group | MC2 / EP-like group |
-| Data movement | Sequence shard and delayed all-gather | Token dispatch/combine by expert |
-| Replaces | all_reduce boundaries | all-gather/all-to-all expert routing |
-| Dense Qwen3.5-27B TP4 | Applicable | Not applicable |
+| 主要目标 | TP Dense 和层间通信边界 | MoE routed expert 通信 |
+| 适用模型 | Dense 和 MoE | 仅 MoE |
+| 通信组 | TP group | MC2 / EP-like group |
+| 数据移动 | sequence shard 和延迟 all-gather | 按 expert dispatch/combine token |
+| 替换对象 | all_reduce 边界 | all-gather/all-to-all expert routing |
+| Dense Qwen3.5-27B TP4 | 适用 | 不适用 |
 
-## Summary
+## 总结
 
-FC1 is best understood as sequence-parallel layer-boundary execution:
+FC1 可以概括为 sequence-parallel 的层间执行方式：
 
 ```text
-RowParallel output:
+RowParallel 输出:
   all_reduce -> reduce_scatter
 
-Layer boundary:
-  full sequence per rank -> sequence shard per rank
+层间 hidden:
+  每 rank 完整 sequence -> 每 rank sequence shard
 
-ColumnParallel input:
-  all_gather only when full sequence is required
+ColumnParallel 输入:
+  只有需要完整 sequence 时才 all_gather
 ```
 
-For Dense models, the main benefits come from smaller RMSNorm/residual/quant workloads, lower activation memory traffic, and Matmul + ReduceScatter fusion. For MoE models, FC1 keeps the same sequence-sharded boundary while routed expert communication handles token movement. MC2 is complementary to FC1 in MoE scenarios, but it solves a different problem: expert token dispatch and combine.
+对 Dense 模型，主要收益来自更小的 RMSNorm/residual/quant 工作量、更低的 activation 访存压力，以及 Matmul + ReduceScatter 融合。对 MoE 模型，FC1 继续保持 sequence-sharded 的层间形态，而 routed expert 通信负责 token 移动。MC2 可以和 MoE 场景下的 FC1 互补，但它解决的是另一个问题：expert token 的 dispatch 和 combine。

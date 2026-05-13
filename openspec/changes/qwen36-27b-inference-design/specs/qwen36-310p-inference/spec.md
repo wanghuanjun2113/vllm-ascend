@@ -26,18 +26,11 @@
 
 #### Scenario: GDN prefill 主路径算子替换
 - **WHEN** Qwen3.6-27B 在 310P 上执行 GDN prefill
-- **THEN** 系统 SHALL 使用 AscendC 优化后的 `chunk_gated_delta_rule_fwd` 替代 PyTorch fallback，或在 fallback 模式下显式标记性能不达标风险。
+- **THEN** 系统 SHALL 使用 AscendC 优化后的 `chunk_gated_delta_rule_fwd`，并保留 PyTorch 参考实现用于正确性对照。
 
 #### Scenario: QKV 与 MRoPE 融合算子可用
 - **WHEN** Qwen3.6-27B 在 310P 上执行 QKV split、RMSNorm 和 MRoPE
 - **THEN** 系统 SHALL 使用 310P 可执行的 `split_qkv_rmsnorm_Mrope` 实现，避免依赖 910 Triton kernel。
-
-### Requirement: 310P 算子性能占比
-新增 310P 算子在整网耗时中的占比相对 910 SHALL 不超过 30%。
-
-#### Scenario: 端到端算子占比验收
-- **WHEN** 完成 310P 端到端 Profiling
-- **THEN** 系统 SHALL 输出五个新增算子的整网耗时占比，并证明该占比相对 910 不超过 30%。
 
 ### Requirement: 310P graph 分阶段启用
 系统 SHALL 在确认 CANN/torch-npu 支持后分阶段启用 310P graph。

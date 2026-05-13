@@ -21,7 +21,7 @@
 - [ ] 3.2 验证 910B4 x4、TP=4、FP16 eager baseline 正确性
 - [ ] 3.3 验证 W8 动态量化加载、quant fusion 和输出精度
 - [ ] 3.4 启用 Chunk Prefill，验证 32K 输入下 prefill 正确性、显存峰值和调度行为
-- [ ] 3.5 启用 ACLGraph Full decode，验证 uniform decode batch 的 capture/replay 和 eager fallback 边界
+- [ ] 3.5 启用 ACLGraph Full decode，验证 uniform decode batch 的 capture/replay 和 eager 路径切换
 - [ ] 3.6 接入 Qwen3.6 MTP，验证 draft、verify、accepted tokens、rejection sampling 和 GDN state 一致性
 - [ ] 3.7 启用 Prefix Cache，分别验证未命中、命中和关闭 Prefix Cache 的输出一致性
 - [ ] 3.8 验收 910 性能基线：启动 <= 8 min，关闭 Prefix Cache 时 32K 输入、10K 输出、TTFT <= 5000 ms、TPOT <= 20 ms/字符
@@ -30,13 +30,13 @@
 
 - [ ] 4.1 验证 300IDuo x2、TP=2、FP16 eager baseline 正确性
 - [ ] 4.2 验证 310P W8 动态量化权重加载和输出精度
-- [ ] 4.3 将 `chunk_gated_delta_rule_fwd` 从 PyTorch fallback 替换或新增为 310P AscendC kernel，并保留 fallback 对照测试
+- [ ] 4.3 将 `chunk_gated_delta_rule_fwd` 从 PyTorch 参考实现替换或新增为 310P AscendC kernel，并保留对照测试
 - [ ] 4.4 实现或适配 310P `rmsnormgated` fused kernel，覆盖 RMSNorm + gate 路径
 - [ ] 4.5 实现或适配 310P `fused_gdn_gating` fused kernel，覆盖 exp、softplus、mul、sigmoid 路径
 - [ ] 4.6 实现 310P `split_qkv_rmsnorm_Mrope`，替代 910 Triton 参考路径
 - [ ] 4.7 校验 `transposeKV` 在 310P 上的 tiling、正确性和端到端收益
-- [ ] 4.8 对五个新增算子做逐算子正确性和 micro benchmark，并输出与 PyTorch fallback 的误差
-- [ ] 4.9 输出 310P 端到端 Profiling，证明新增算子整网耗时占比相对 910 不超过 30%
+- [ ] 4.8 对五个新增算子做逐算子正确性和 micro benchmark，并输出与 PyTorch 参考实现的误差
+- [ ] 4.9 输出 310P 端到端 Profiling，定位新增算子、通信、调度和内存访问的主要耗时来源
 - [ ] 4.10 验收 310 性能基线：启动 <= 13.5 min，关闭 Prefix Cache 时 4K 输入、4K 输出、TTFT <= 4000 ms、TPOT <= 60 ms/字符
 
 ## 5. 精度对齐与 Profiling 闭环
@@ -45,12 +45,12 @@
 - [ ] 5.2 记录 FP16 baseline 的输出 token、关键 logits 或业务指定精度指标
 - [ ] 5.3 对 W8 动态量化输出做白盒或黑盒精度对齐，输出误差报告
 - [ ] 5.4 生成 910 分段 Profiling 报告，覆盖启动、prefill、decode、MTP draft、verify、sampling、通信、KV/SSM state 更新
-- [ ] 5.5 生成 310 分段 Profiling 报告，覆盖五个新增算子和 fallback 路径耗时
+- [ ] 5.5 生成 310 分段 Profiling 报告，覆盖五个新增算子和当前 PyTorch 路径耗时
 - [ ] 5.6 固化测试元数据记录格式，包含模型 revision、vLLM/vllm-ascend 版本、CANN/torch-npu 版本、硬件型号、量化格式和所有关键开关
 
 ## 6. 文档与验收交付
 
 - [ ] 6.1 补充 Qwen3.6-27B 部署教程，列出 910 和 310 推荐启动参数
-- [ ] 6.2 补充故障定位章节，覆盖启动超时、GCC 依赖、graph capture 失败、MTP 输出不一致、Prefix Cache 命中异常和 310P fallback 性能不达标
+- [ ] 6.2 补充故障定位章节，覆盖启动超时、GCC 依赖、graph capture 失败、MTP 输出不一致、Prefix Cache 命中异常和 310P 性能不达标
 - [ ] 6.3 将 910、310、打包、安全扫描和精度报告归档到发布验收记录
 - [ ] 6.4 执行 OpenSpec 状态检查，确认 `proposal`、`design`、`specs`、`tasks` 均为 done

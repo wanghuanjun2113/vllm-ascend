@@ -1,17 +1,17 @@
 ## ADDED Requirements
 
-### Requirement: 0.18.0 新增 RTSP 包
-系统 SHALL 为 vllm-ascend 0.18.0 提供 `netrsnpython3rdadvance` RTSP 包。
+### Requirement: Qwen3.6 候选版本线新增 RTSP 包
+系统 SHALL 为 Qwen3.6 候选版本线提供 `netrsnpython3rdadvance` RTSP 包；候选版本线当前按 0.18.0 设计，但允许切换为 0.19.x.rcx。
 
-#### Scenario: 0.18.0 包选择
-- **WHEN** 产品 CR 选择 0.18.0 版本路径
+#### Scenario: 候选版本包选择
+- **WHEN** 产品 CR 选择 0.18.0 或 0.19.x.rcx 版本路径
 - **THEN** 系统 SHALL 加载 `netrsnpython3rdadvance`，并使用该包内固定的 vLLM/vllm-ascend 依赖运行 Qwen3.6-27B。
 
-### Requirement: 0.18.0 运行态无 GCC 依赖
-系统 MUST 消除 0.18.0 运行态 GCC 依赖。
+### Requirement: Qwen3.6 候选版本线运行态无 GCC 依赖
+系统 MUST 消除 Qwen3.6 候选版本线运行态 GCC 依赖。
 
 #### Scenario: 运行态安全扫描
-- **WHEN** 对 0.18.0 Qwen3.6 镜像或 RTSP 包执行运行态依赖扫描
+- **WHEN** 对 Qwen3.6 候选版本线镜像或 RTSP 包执行运行态依赖扫描
 - **THEN** 扫描结果 MUST 证明运行态不包含 GCC 编译依赖，且启动过程不触发源码编译。
 
 ### Requirement: 自定义算子预编译
@@ -29,8 +29,8 @@
 - **THEN** 系统 SHALL 使用已准备的 cache 或预编译产物，不 SHALL 在运行态触发 GCC 相关编译。
 
 ### Requirement: 包版本可回滚
-系统 SHALL 保留 0.13.0 与 0.18.0 两条可独立选择的包路径。
+系统 SHALL 保留 0.13.0 与 Qwen3.6 候选版本线两条可独立选择的包路径。
 
-#### Scenario: 0.18.0 不达标回滚
-- **WHEN** 0.18.0 Qwen3.6 路径性能、精度或安全扫描不达标
+#### Scenario: Qwen3.6 候选版本不达标回滚
+- **WHEN** Qwen3.6 候选版本线路径性能、精度或安全扫描不达标
 - **THEN** 系统 SHALL 支持通过 CR 参数停止 Qwen3.6 实例或回退到 0.13.0 既有模型路径，不影响 0.13.0 模型服务。

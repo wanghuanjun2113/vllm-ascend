@@ -1,0 +1,11 @@
+- [x] 根据 Qwen3.6 27B config 推导 Full Attention KV cache 的单 token 字节数。
+- [x] 推导 Linear Attention GDN SSM state 的单 checkpoint 字节数。
+- [x] 计算不同 checkpoint 间隔下摊销到每个 token 的显存占用。
+- [x] 在明确预算假设下估算 910B4 32G 四卡与八卡可缓存的 token 数量。
+- [x] 将四卡部署单卡可用 KVCache 约 17.48G 的实测经验值纳入工程预算。
+- [x] 纳入 TP=8 下 Full Attention KV heads 少于 TP size 导致的 KV cache 复制。
+- [x] 删除裸 cache-only HBM 理论上限表。
+- [x] 补充 KV Cache 池化目的、架构、关键交互、DRAM 容量与 TTFT 收益分析。
+- [x] 补充面向 Prefix Caching 命中率的 Agent 请求设计指导。
+- [ ] 通过实际部署 memory profiling 校验八卡 runtime/cache 显存预算。
+- [ ] 决定目标 GDN checkpoint 间隔与存储层级。

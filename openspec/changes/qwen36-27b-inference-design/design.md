@@ -118,10 +118,8 @@ Qwen3.6 当前按 0.18.0 包线设计；后续若产品选择 0.19.x.rcx，则 0
 910 标准交付配置：
 
 - 硬件：910B4 32G x4。
-- 并行：TP=4。
-- 并发：4。
 - 量化：W8 动态量化，优先复用 `--quantization ascend` 和模型量化配置。
-- Decode：ACLGraph Full decode，prefill 或 mixed batch 可退回 eager/piecewise。
+- Decode：ACLGraph Full decode，prefill 或 mixed batch 可退回 eager。
 - Prefill：启用 Chunk Prefill，长输入按 scheduler 切分，避免单次 prefill 峰值过高。
 - Prefix Cache：启用后单独验证命中收益；关闭时用于 TTFT 基线。
 - MTP：入口使用现有 `mtp` speculative dispatch 到 `AscendEagleProposer`；Qwen3.6 需要独立确认模型结构、权重加载、KV/SSM state 绑定和 GDN 状态一致性。
@@ -131,16 +129,27 @@ ACLGraph 约束来自 `ACLGraphWrapper`：capture/replay 依赖稳定的 batch d
 
 MTP 约束来自 `model_runner_v1.py` 和 `eagle_proposer.py`：spec decode 会改变 draft token、logits indices、GDN metadata、accepted token 和 rejection sampling 链路。Qwen3.6 接入时必须验证 GDN `spec_token_indx`、SSM state indices、accepted token 数量与 full graph capture size 一致。
 
-替代方案：为 Qwen3.6 新建独立 speculative proposer。当前代码已有通用 `mtp` 路由和 draft graph 支持；除非 Qwen3.6 MTP head 与现有输入输出契约不兼容，否则不新增 proposer。
+#### 极低时延方案
+
+极低时延方案面向单请求长上下文交互场景，使用 8 卡 910B4 配置承载 Qwen3.6-27B。该方案以 batchSize=1、32K 输入为目标，通过 Prefix Caching 降低重复前缀 prefill 开销，通过 MTP 降低 decode 单 token 推进次数，并叠加 ACLGraph Full decode、W8 动态量化和通信优化以压缩端到端时延。
+
+| 指标 | 目标值 | 条件 |
+|---|---:|---|
+| 硬件 | 910B4 x8 | 单实例极低时延配置 |
+| 输入长度 | 32K | 长上下文单请求 |
+| batchSize | 1 | 低并发、低时延优先 |
+| Prefix Caching | 开启 | 依赖业务前缀复用 |
+| MTP | 开启 | 需验证 Qwen3.6 MTP head 与 GDN state 一致性 |
+| TTFT | <= 1.5 s | Prefix Cache 命中场景 |
+| TPOT | <= 10 ms/token | MTP、Full decode graph 与量化优化叠加 |
+
 
 ### 5. 310 推理方案
 
 310 标准交付配置：
 
 - 硬件：300IDuo 96G。
-- 并行：TP=2。
-- 并发：4。
-- dtype：FP16 baseline，W8 动态量化作为性能目标。
+- dtype：W8 动态量化作为性能目标。
 - 首个交付底座：eager correctness。
 - Graph：在 CANN/torch_npu 对 310P graph 能力确认后分阶段启用。
 

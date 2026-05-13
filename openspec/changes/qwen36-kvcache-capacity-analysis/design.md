@@ -21,8 +21,12 @@
 5. [KV Cache 池化方案](#5-kv-cache-池化方案)
    - 5.1 [池化目的](#51-池化目的)
    - 5.2 [总体架构](#52-总体架构)
-   - 5.3 [池化容量分析](#53-池化容量分析)
-   - 5.4 [TTFT 收益](#54-ttft-收益)
+   - 5.3 [当前代码支持边界](#53-当前代码支持边界)
+   - 5.4 [Qwen3.6 混合注意力池化简要设计](#54-qwen36-混合注意力池化简要设计)
+   - 5.5 [池化容量分析](#55-池化容量分析)
+   - 5.6 [TTFT 传输时延理论估算](#56-ttft-传输时延理论估算)
+   - 5.7 [Layerwise KVCache 搬运方案](#57-layerwise-kvcache-搬运方案)
+   - 5.8 [TTFT 收益](#58-ttft-收益)
 6. [Agent 请求设计对 Prefix Caching 命中的影响](#6-agent-请求设计对-prefix-caching-命中的影响)
    - 6.1 [从 OpenAI Request 到 LLM 输入](#61-从-openai-request-到-llm-输入)
    - 6.2 [Agent 侧设计要求](#62-agent-侧设计要求)
@@ -38,7 +42,8 @@
 - **单 token 开销**：Qwen3.6 27B 的 Full Attention KV cache 在逻辑唯一口径下为 **64 KiB/token**。但模型只有 4 个 KV heads，TP=8 时每卡仍至少保存 1 个 KV head，因此 Full Attention KV cache 会发生复制，物理分配口径变为 **128 KiB/token**。GDN Linear Attention 的 SSM state 每个 checkpoint 为 **144 MiB**，checkpoint 间隔越短，摊销到每个 token 的开销越高。
 - **HBM 容量预算**：按实测 4 卡部署单卡可用 KVCache **17.48GiB** 估算，TP=4 总预算为 **69.92GiB**。在不保存 GDN checkpoint 时可缓存约 **1.15M tokens**；checkpoint 间隔为 1,024 tokens 时约 **352K tokens**。TP=8 虽然总 HBM cache/state 预算线性外推到 **139.84GiB**，但 Full Attention 4 个 KV heads 会复制，因此不保存 GDN checkpoint 时最大 token 数仍约 **1.15M**。
 - **DRAM 池化方案**：建议在单台 910B4 上部署 2 个 TP=4 的 vllm-ascend PD 混合实例，共享 1 个 Mooncake DRAM KV Cache Pool。若预留 **512GiB DRAM**，仅池化 Full KV 时可缓存约 **8.39M tokens**，约等价 **128 个 64K prefix**；若同时池化 GDN checkpoint，建议优先评估 4,096 或 8,192 token 间隔。
-- **TTFT 收益**：实测 64K 输入场景下，DRAM cache 命中率约 90% 时，TTFT 从 **38.3s** 降至 **14.4s**，相对下降 **62.4%**，加速比约 **2.66x**。后续 layerwise 方案预计还能进一步降低 TTFT。
+- **代码支持边界**：当前 AscendStore KV Pool 路径具备 block hash lookup/load/store 和 layerwise 框架，但尚未把 Qwen3.6 的 Full KV、GDN SSM checkpoint、GDN live state 建模为不同池化对象。因此本文给出 Qwen3.6 混合注意力池化的简要设计，建议先支持 Full KV 池化，再逐步加入 GDN checkpoint。
+- **TTFT 收益**：实测 64K 输入场景下，DRAM cache 命中率约 90% 时，TTFT 从 **38.3s** 降至 **14.4s**，相对下降 **62.4%**，加速比约 **2.66x**。理论传输下界通常是几十到百毫秒，主要收益来自避免大部分 prefill 计算；后续 layerwise 方案预计还能进一步降低可见 TTFT。
 - **Agent 请求设计**：Prefix Caching 命中的是最终渲染后的 token 前缀。Qwen3.6 chat template 会先渲染 `tools`，再追加首个 `system` message，因此 Agent 必须稳定工具集合、工具顺序、system prompt、chat template 参数和共享上下文格式，否则 DRAM 池化容量无法有效转化为命中率。
 
 ## 2. 基础事实与计算假设
@@ -91,6 +96,7 @@
 - 推荐部署形态为 2 个 TP=4 的 vllm-ascend PD 混合实例，共享 1 个 Mooncake DRAM KV Cache Pool。
 - DRAM 池化主路径只考虑内存介质。SSD 因延迟和带宽限制，不作为在线 TTFT 优化主路径，只适合作为冷数据或离线预热兜底。
 - 池化对象包括 Full Attention KV blocks；GDN SSM checkpoint 可选，是否池化取决于 checkpoint 间隔、热度和恢复成本。
+- TTFT 传输时延估算采用保守工程带宽：PCIe 4.0 x16 按 25 GB/s/card 有效带宽估算，HCCS 跨卡分发按 100 到 200 GB/s 级别估算；生产部署需要用目标机器实测带宽替换该假设。
 
 ### 2.5 Prefix Caching 与 Agent 请求假设
 
@@ -337,7 +343,55 @@ KV Cache 池化的目标是把“热 prefix 的 KV blocks 和必要的 Linear At
 5. 新完成的 Full KV blocks 与 GDN checkpoint 异步写回 Mooncake，供本机另一个实例或后续请求复用。
 6. 池中对象按 LRU、TTL 或业务热度淘汰；HBM 只保留 live state 与最近热点。
 
-### 5.3 池化容量分析
+### 5.3 当前代码支持边界
+
+当前代码中存在两类 KV 传输能力，需要区分：
+
+1. **AscendStore KV Pool 路径**：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py` 提供 `AscendStoreConnector`，后端可选 Mooncake、Memcache、Yuanrong。`KVPoolWorker` 会根据 block hash 做 lookup/load/store，并支持 `use_layerwise`。
+2. **Mooncake P2P Layerwise 路径**：`vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py` 已经显式识别 `MambaSpec`、`FullAttentionSpec`、`SlidingWindowSpec`，并有混合 Attention + Mamba 的注册与传输逻辑。
+
+代码事实：
+
+- `KVPoolWorker.register_kv_caches()` 只从第一个 cache tensor 推导 `num_blocks` 和 `block_len`，然后把所有 cache tensor 按同一套 `block_len` 规则注册到后端。见 `pool_worker.py` 的 `register_kv_caches()`。
+- `ChunkedTokenDatabase.prepare_value()` 和 `prepare_value_layer()` 基于统一的 `kv_caches_base_addr` 与 `block_len` 计算地址和长度。见 `config_data.py`。
+- AscendStore 的 layerwise store/load 会把每个 block 拆成 `num_layers` 个 `LayerPoolKey`，但 key 里只有 `layer_id`，没有区分 Full Attention KV、GDN conv state、GDN SSM state 或 checkpoint interval。见 `pool_worker.py::retrieve_layer()`、`store_layer()`、`lookup_scheduler()`。
+- Qwen3.6 的 GDN 路径会调用 `maybe_save_kv_layer_to_connector("", [])`，即依赖 connector 当前层计数触发 layerwise hook，而不是显式传入 GDN state 对象。见 `vllm_ascend/ops/gdn.py` 与 `vllm_ascend/_310p/ops/fla/gdn_310.py`。
+- P2P 的 Mooncake layerwise connector 中，`register_kv_caches()` 会检测一个 cache tensor 是否同时被 Mamba 和 Attention layer 共享，并设置 `use_attn_mamba_hybrid`；传输侧 `get_transfer_meta()` 对 `MambaSpec` 单独处理 conv/ssm state。见 `mooncake_layerwise_connector.py`。
+
+因此，当前代码可以确认支持的是 **Full Attention KV blocks 的外部池化基础能力**，并且具备通用 layerwise load/store 框架；但还不能直接认定已经完整支持 Qwen3.6 这种 Full Attention + GDN Linear Attention 的 **语义正确 KV Cache 池化**。主要缺口是：AscendStore pool 路径没有把 Full KV、GDN SSM checkpoint、GDN conv/live state 建模成不同对象，也没有定义 GDN checkpoint interval、checkpoint key、恢复边界和 replay 规则。
+
+### 5.4 Qwen3.6 混合注意力池化简要设计
+
+建议把 Qwen3.6 的池化对象拆成三类，而不是把所有 cache tensor 当成同一种 block payload：
+
+| 对象 | Key 维度 | Payload | 读取时机 | 说明 |
+|---|---|---|---|---|
+| Full Attention KV block | `model + prefix_profile + block_hash + full_layer_id + tp/head_rank` | K/V block shard | prefill 前或 layerwise 到达该 full layer 前 | 必须支持 TP=8 下 KV head 复制语义 |
+| GDN SSM checkpoint | `model + prefix_profile + checkpoint_token + linear_layer_id + tp_rank + checkpoint_interval` | GDN SSM state shard，FP32 | 恢复到最近 checkpoint 后 | 只保存 checkpoint，不建议每 128 token 都保存 |
+| GDN conv/live state | 不作为 DRAM pool 默认对象 | live request 内部状态 | 请求执行过程中 | conv/live state 更适合留在 HBM；跨请求复用优先依赖 SSM checkpoint |
+
+推荐恢复流程：
+
+```text
+1. 对渲染后的 token prefix 做 block hash lookup。
+2. 找到 Full KV 连续命中的最大 block 边界。
+3. 在该边界之前，选择最近的 GDN checkpoint。
+4. 从 DRAM pool 加载：
+   - 命中范围内的 Full Attention KV blocks
+   - 最近 GDN SSM checkpoint
+5. 从 checkpoint_token 到 hit_token 边界 replay GDN linear layers。
+6. 从 hit_token 之后继续正常 prefill，然后进入 decode。
+```
+
+设计要点：
+
+- **对象分层**：Full KV 是按 token/block 增长的 cache；GDN SSM checkpoint 是按 checkpoint interval 增长的 state。两者 key、生命周期、淘汰策略都应分开。
+- **命中判定**：只有 Full KV blocks 和必要的 GDN checkpoint 同时可用，才能把 prefix 命中推进到对应 token 边界；否则只能退回到最近可恢复边界。
+- **checkpoint interval**：优先评估 4,096 或 8,192 tokens。间隔过小会显著增加 DRAM 占用，间隔过大会增加 GDN replay 时间。
+- **TP=8 复制语义**：Full Attention 只有 4 个 KV heads。TP=8 时 key 中的 `head_or_tp_rank` 需要表达复制后的物理 shard，不能简单按 8 份唯一 KV 计算。
+- **与现有代码复用**：可以复用 AscendStore 的 block hash lookup、Mooncake/Memcache backend、layerwise load/store 线程；但需要新增 Qwen3.6 hybrid cache metadata，把 `layer_id` 扩展为 `cache_object_type + layer_id + checkpoint_id`。
+
+### 5.5 池化容量分析
 
 基线假设：
 
@@ -376,7 +430,80 @@ KV Cache 池化的目标是把“热 prefix 的 KV blocks 和必要的 Linear At
 - 4,096 或 8,192 token checkpoint 更适合作为 DRAM 池化的默认候选：512GiB 下分别可容纳约 **81 个** 或 **99 个 64K prefix**。
 - 若业务可以接受命中 Full KV 后重算部分 GDN state，则可以只池化 Full KV，把 GDN checkpoint 作为二期优化或只对超热点 prefix 开启。
 
-### 5.4 TTFT 收益
+### 5.6 TTFT 传输时延理论估算
+
+以 64K 输入、90% DRAM cache 命中为例，按 128-token block 对齐后约命中 58,880 tokens。TP=4 时 Full Attention KV 物理总量为 64 KiB/token，因此需要从 DRAM 读取：
+
+```text
+Full KV 数据量 = 58,880 * 64 KiB = 3.594 GiB / TP=4 实例
+单卡读取量 = 3.594 GiB / 4 = 0.898 GiB/card
+若同时加载 1 个 GDN SSM checkpoint = 144 MiB / 实例 = 36 MiB/card
+合计约 3.734 GiB / 实例，0.934 GiB/card
+```
+
+不同上下文长度下，90% 命中需要搬运的数据量如下：
+
+| 输入长度 | 90% 命中 tokens（128 对齐） | Full KV 数据量 / TP=4 实例 | Full KV 数据量 / card | 加 1 个 GDN checkpoint |
+|---:|---:|---:|---:|---:|
+| 32K | 29,440 | 1.797 GiB | 0.449 GiB | 1.938 GiB |
+| 64K | 58,880 | 3.594 GiB | 0.898 GiB | 3.734 GiB |
+| 128K | 117,888 | 7.195 GiB | 1.799 GiB | 7.336 GiB |
+
+带宽口径采用保守工程估算，实际值需要用目标 910B4 机器实测固化：
+
+- PCIe 4.0 x16 单向理论带宽约 32 GB/s；考虑 DMA、协议、NUMA、host DRAM、并发 copy 影响，按 **25 GB/s/card 有效带宽** 做保守估算。
+- HCCS 是 NPU-NPU 互联，不是 host DRAM 到 NPU HBM 的主路径。如果需要先落到某张卡再跨卡分发，按 **100 到 200 GB/s** 级别估算 HCCS 分发成本。
+- DRAM pool 到 NPU HBM 的主耗时通常由 host DRAM 读取、PCIe DMA、后端调度、同步点共同决定；纯链路带宽只给出下界。
+
+64K、90% 命中场景的理论传输下界：
+
+| 传输路径假设 | 数据量 | 带宽假设 | 理论耗时 |
+|---|---:|---:|---:|
+| 4 卡并行 PCIe 读取，仅 Full KV | 0.898 GiB/card | 25 GB/s/card | 约 39 ms |
+| 4 卡并行 PCIe 读取，Full KV + 1 个 GDN checkpoint | 0.934 GiB/card | 25 GB/s/card | 约 40 ms |
+| 单链路串行读取，仅 Full KV | 3.594 GiB | 25 GB/s | 约 154 ms |
+| 单链路串行读取，Full KV + 1 个 GDN checkpoint | 3.734 GiB | 25 GB/s | 约 160 ms |
+| HCCS 跨卡分发，仅 Full KV | 3.594 GiB | 100 GB/s | 约 39 ms |
+| HCCS 跨卡分发，仅 Full KV | 3.594 GiB | 200 GB/s | 约 19 ms |
+
+因此，64K 输入下 DRAM 命中后从 38.3s 降到 14.4s 的主要收益不是来自“传输很快”本身，而是避免了大部分 prefill 计算。纯数据搬运的理论量级通常是几十到百毫秒；剩余 TTFT 主要由未命中 suffix prefill、GDN checkpoint replay、后端 lookup、DMA 调度、同步等待、batch 排队和 layerwise overlap 效果决定。
+
+### 5.7 Layerwise KVCache 搬运方案
+
+非 layerwise 方案会在 prefill 开始前尽量把命中的 KV 全部搬入 HBM。优点是实现简单，缺点是首 token 必须等待完整 KV load 完成，且一次性 HBM/PCIe 压力较大。
+
+Layerwise 方案把 KV load/store 从“请求级”拆到“层级”：
+
+```text
+普通 load：
+  lookup all blocks
+  load all matched KV/state
+  wait
+  run prefill
+
+layerwise load：
+  lookup all blocks
+  load layer 0 KV/state
+  run layer 0
+  while run layer i:
+      async load layer i+1
+      async store layer i-1
+  run final layers
+```
+
+在当前代码中，AscendStore 路径已有 `use_layerwise` 开关：`start_load_kv()` 会创建 `retrieve_layer()` 生成器并先发起第一层 load；`wait_for_layer_load()` 在模型执行到下一层前推进下一次 load；`save_kv_layer()` 则按层触发 store。底层 `KVCacheStoreLayerSendingThread` 和 `KVCacheStoreLayerRecvingThread` 按 `layer_id` 调用 `prepare_value_layer()` 做 put/get。
+
+对 Qwen3.6，layerwise 设计需要额外处理混合层：
+
+- Full Attention 层：按 layer_id 搬运 K/V block shard。
+- GDN Linear Attention 层：按 checkpoint boundary 搬运 SSM checkpoint；若 checkpoint 不在当前命中边界，需要先恢复 checkpoint，再 replay 到目标 token。
+- 层顺序：Qwen3.6 是 3 个 linear_attention + 1 个 full_attention 重复。layerwise load 不应只按 `num_layers` 平铺同质 KV，而应根据 `layer_types` 决定当前层需要 Full KV、GDN state，还是只需要 live state。
+- 同步点：每层计算前只等待本层必要对象；下一层对象异步预取，上一层对象异步写回。
+- 命中判断：layerwise lookup 应能区分“Full KV 全层命中”与“GDN checkpoint 缺失”。否则可能出现 Full KV 命中但 GDN state 不可恢复，导致语义上不能跳过 prefix 计算。
+
+Layerwise 的预期收益是把几十到百毫秒级的 DRAM/PCIe 搬运隐藏到逐层计算中，并降低请求开始阶段的一次性等待。它不能减少需要搬运的总字节数，但可以减少可见 TTFT；最终收益取决于每层计算时间、每层 KV/state 大小、DMA 并发度和同步开销。
+
+### 5.8 TTFT 收益
 
 实测 64K 输入场景，在 DRAM cache 命中率约 90% 时：
 

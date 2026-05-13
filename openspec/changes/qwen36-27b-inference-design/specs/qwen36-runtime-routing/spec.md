@@ -9,7 +9,7 @@
 
 #### Scenario: 选择 Qwen3.6 候选版本路径
 - **WHEN** 产品 CR 声明 `spec.vllmVersion=0.18.0` 或 `spec.vllmVersion=0.19.x.rcx`
-- **THEN** 系统 SHALL 选择对应的 Qwen3.6 候选 vLLM/vllm-ascend 版本组合和 `netrsnpython3rdadvance` RTSP 包，并允许承载 Qwen3.6-27B。
+- **THEN** 系统 SHALL 选择对应的 Qwen3.6 候选 vLLM/vllm-ascend 版本组合和 `netrsnpython3rdadvance` RTSP 包，并允许承载 Qwen3.6-27B；0.19.x.rcx 路径 SHALL 作为 0.18.0 路径的整体替换选项处理。
 
 ### Requirement: 微服务边界清晰
 系统 MUST 将 `NetrsnQwenLargeService` 和 `NetrsnQwenMoeMediumService` 视为外部路由层，不在 vllm-ascend 内实现其内部逻辑。

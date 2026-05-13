@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Qwen3.6 候选版本线新增 RTSP 包
-系统 SHALL 为 Qwen3.6 候选版本线提供 `netrsnpython3rdadvance` RTSP 包；候选版本线当前按 0.18.0 设计，但允许切换为 0.19.x.rcx。
+系统 SHALL 为 Qwen3.6 候选版本线提供 `netrsnpython3rdadvance` RTSP 包；候选版本线当前按 0.18.0 设计，后续若产品选择 0.19.x.rcx，则 0.19.x.rcx SHALL 作为 0.18.0 的整体替换路径。
 
 #### Scenario: 候选版本包选择
 - **WHEN** 产品 CR 选择 0.18.0 或 0.19.x.rcx 版本路径

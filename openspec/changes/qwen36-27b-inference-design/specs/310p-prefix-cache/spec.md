@@ -28,6 +28,30 @@
 - **WHEN** SSMStatePool 中的 checkpoint 数量超过 `max_checkpoints` 上限
 - **THEN** 按最近最少使用策略淘汰旧 checkpoint，释放显存
 
+### Requirement: 用户可配置 Linear Attention Checkpoint 保存策略
+
+系统 SHALL 提供外部接口配置 Linear Attention checkpoint 保存策略，用于控制 SSMStatePool 的 checkpoint 创建密度和语义锚点。
+
+#### Scenario: 策略字段透传
+- **WHEN** 外部服务或部署层传入 `linearCheckpointPolicy`
+- **THEN** 系统 SHALL 支持 `mode`、`intervalTokens`、`anchors`、`maxCheckpointsPerRequest` 和 `maxCheckpointsPerPrefixProfile` 字段，并将策略传递到 SSM checkpoint 创建逻辑。
+
+#### Scenario: 固定 tools/system prompt 只保存一个 checkpoint
+- **WHEN** `mode=anchor` 且 `anchors=["tools", "system_prompt"]`，同时 `maxCheckpointsPerRequest=1`
+- **THEN** 系统 SHALL 只在 chat template 渲染后的稳定 tools + system prompt token 边界保存一个 SSM checkpoint，动态 user content 不创建新的 SSM checkpoint。
+
+#### Scenario: checkpoint key 版本绑定
+- **WHEN** 创建 anchor checkpoint
+- **THEN** checkpoint key SHALL 绑定 token hash、`prefix_profile_key`、模型 revision、tokenizer revision、chat template version、tool schema version、system prompt version 和 thinking mode。
+
+#### Scenario: 显存安全上限
+- **WHEN** 用户策略请求的 checkpoint 数量或间隔超过全局显存预算
+- **THEN** 系统 SHALL 按全局 `max_checkpoints`、LRU 淘汰和服务端安全上限裁剪策略；用户策略只能减少 checkpoint 数量或放大保存间隔，不能突破全局上限。
+
+#### Scenario: 策略关闭
+- **WHEN** `mode=disabled`
+- **THEN** 系统 SHALL 不保存 GDN SSM checkpoint，仅保留 Full Attention block-level prefix cache，并在 profiling 中记录 GDN prefix 重算开销。
+
 ### Requirement: SSMStatePool 数据结构
 
 系统 SHALL 实现 `SSMStatePool` 和 `SSMCheckpoint` 数据结构。

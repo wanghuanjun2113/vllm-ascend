@@ -11,18 +11,22 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 
 ### 910 推理链路
 - 明确 910 推理链路：W8 动态量化、ACLGraph Full decode、Chunk Prefill、MTP、Prefix Cache 与 CoT 控制。
+- 明确阶段性能目标：26.3 以 Qwen3 32B 作为对照；630 覆盖 Qwen3.6 27B 在 910B4*4 上 8K/8K 并发 8、32K/10K 并发 4；930 将 32K/10K 并发 4 的 TTFT 收敛到 5000 ms。
 - 极低时延方案：910B4 x8、batchSize=1、Prefix Caching + MTP 叠加，目标 TTFT <= 1.5s（Prefix Cache 命中）、TPOT <= 10ms/token。
 
 ### 310P 算子开发（qwen36-27b-310p-operators）
 - GDN 核心算子（已具备）：`causal_conv1d_fwd_kernel`、`causal_conv1d_update_kernel`、`fused_recurrent_gated_delta_rule_fwd_kernel`
-- GDN 核心算子（开发中）：`chunk_gated_delta_rule_fwd`（SAIE）、`fused_sigmoid_gating_delta_rule_310`（SAIE+NAIE）
+- GDN 核心算子（开发中）：`chunk_gated_delta_rule_fwd`（SAIE，310P TTFT 最高影响项，预计替换当前路径后 TTFT 降低约 40%）、`fused_sigmoid_gating_delta_rule_310`（SAIE+NAIE）
 - QKV/RoPE 算子：`mRope`（高优先级）、`split_qkv_rmsnorm_Mrope`、`rmsnormgated`、`transposeKV`（NAIE 开发）
 - 注意力/投机推理算子：`fused_gdn_gating`（高优先级）、FIA 压缩 mask、rejection sampling 系列（greedy/random/block_verify/recovered_tokens）、`npu_copy_and_expand_eagle_inputs`、`prepare_inputs_padded`、`apply_sampling_constraints`
 
 ### 310P 关键特性使能（qwen36-310p-key-features）
 - Chunk Prefill：Full Attention SplitFuse（310P NZ 格式 mask 适配）+ GDN 层 chunk prefill（跨 chunk SSM state 传递）
 - Prefix Caching：Full Attention block-level（复用 vLLM 框架）+ GDN SSM State Checkpoint（SSMStatePool 全新实现）
+- Linear Attention checkpoint 保存策略：开放用户接口按 `disabled`、`interval`、`anchor`、`auto` 配置保存行为；固定 tools/system prompt 场景可只保存一个 checkpoint，降低常驻显存
 - MTP 投机推理：Attention 后端 SpecDecoding 支持修复、`npu_copy_and_expand_eagle_inputs` PyTorch fallback、GDN multi-query 路径、rejection sampling PyTorch fallback
+- MTP 增量优化：Qwen3.6 MTP 接受率预期较高，直接训练 Eagle3 draft 模型收益有限；后续评估 MTP 分支领域化微调，以及 DFlash 使能与 DFlash 模型领域化微调
+- 明确阶段性能目标：300IDuo*2 单卡显存 96G；630 为 4K/4K 并发 2、TTFT <= 5000 ms、TPOT <= 80 ms/字符；930 为 4K/4K 并发 4、TTFT <= 4000 ms、TPOT <= 60 ms/字符；4 卡 300VPro 按同一基线验收。
 
 ### 混合注意力缓存优化（qwen36-hybrid-attn-cache-optimization）
 - 修改算子支持非连续 block 访问，消除 KV cache 和 GDN SSM state 之间的 padding blocks
@@ -31,10 +35,10 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 
 ### KV Cache 容量分析（qwen36-kvcache-capacity-analysis）
 - Full Attention KV cache 单 token 开销 64 KiB/token（TP=4），GDN SSM checkpoint 144 MiB/checkpoint
-- 910B4 x4 (TP=4) 实测工程预算 69.92 GiB：不保存 GDN checkpoint 时可缓存 ~1.15M tokens
+- 910B4*4 (TP=4) 实测工程预算 69.92 GiB：不保存 GDN checkpoint 时可缓存 ~1.15M tokens
 - KV Cache 池化方案：单机 2 个 TP=4 PD 混合实例共享 1 个 Mooncake DRAM pool（>=512GiB），仅 Full KV 可缓存 ~128 个 64K prefix
 - 实测 TTFT 收益：64K 输入 90% DRAM 命中时 TTFT 从 38.3s 降至 14.4s（-62.4%，2.66x）
-- Agent 请求设计指导：稳定 tools > 稳定 system prompt > 稳定共享上下文格式
+- Agent 请求设计指导：稳定 tools > 稳定 system prompt > 稳定共享上下文格式；固定 tools/system prompt 推荐使用 anchor checkpoint 策略
 
 ### 精度与性能闭环
 - 建立精度和性能闭环：FP16 baseline、W8 动态量化精度对齐、CoT/MTP/Prefix Cache 组合验证
@@ -45,8 +49,8 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 ### New Capabilities
 
 - `qwen36-runtime-routing`: 产品 CR 参数驱动 vLLM/vllm-ascend/RTSP 包/镜像选择，覆盖 0.13.0 与 Qwen3.6 候选版本线
-- `qwen36-910-inference`: Qwen3.6-27B 在 910B4 x4 上的推理配置、优化特性和性能验收
-- `qwen36-310p-inference`: Qwen3.6-27B 在 300IDuo x2 上的 eager/graph 推理路径、算子要求和性能验收
+- `qwen36-910-inference`: Qwen3.6-27B 在 910B4*4 上的推理配置、优化特性和性能验收
+- `qwen36-310p-inference`: Qwen3.6-27B 在 300IDuo*2 上的 eager/graph 推理路径、算子要求和性能验收
 - `qwen36-quantization-accuracy`: FP16 baseline、W8 动态量化、CoT/MTP/Prefix Cache 组合下的精度对齐和 Profiling 闭环
 - `qwen36-packaging`: RTSP 包、运行态依赖、GCC 去依赖和版本包验收要求
 - `310p-gdn-ops`: GDN 混合注意力核心算子集（causal_conv1d、gated_delta_rule、sigmoid_gating），含 prefill/decode 双路径
@@ -73,5 +77,5 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
   - 缓存优化：`vllm_ascend/worker/model_runner_v1.py`、`vllm_ascend/worker/block_table.py`、`vllm_ascend/patch/platform/patch_mamba_config.py`
   - KV Transfer：`vllm_ascend/distributed/kv_transfer/`
 - 外部系统：`NetrsnQwenLargeService`、`NetrsnQwenMoeMediumService`、产品 CRD、RTSP 打包流水线和镜像构建系统
-- 验收依赖：910B4 x4、300IDuo x2、Qwen3.6-27B FP16/W8 权重、Profiling 工具链和安全扫描工具
+- 验收依赖：910B4*4、300IDuo*2 或等价 4 卡 300VPro、Qwen3.6-27B FP16/W8 权重、Profiling 工具链和安全扫描工具
 - 依赖团队：SAIE（chunk_gated_delta_rule_fwd、fused_sigmoid_gating_delta_rule_310）、NAIE（fused_gdn_gating、mRope 等）、NAIE 能力中心（FIA compressed mask、rejection sampling）

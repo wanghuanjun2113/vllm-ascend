@@ -101,6 +101,8 @@ chunk_gated_delta_rule_pytorch(
 
 算法 SHALL 使用 chunk 并行策略（CHUNK_SIZE=64），包含 WY 表示、下三角求解和跨 chunk 递推。
 
+该算子 SHALL 作为 310P GDN prefill 的最高优先级缺失算子处理；性能评估 SHALL 单独统计其对 TTFT 的影响，当前工程预测为替换 PyTorch 路径后 TTFT 降低约 40%。
+
 #### Scenario: Prefill 路径 chunk 并行计算
 - **WHEN** 输入为 prefill 序列（长序列），`cu_seqlens` 指定 varlen 边界，`output_final_state=True`
 - **THEN** 执行 chunk 分块并行计算，返回 attention 输出和最终 SSM state

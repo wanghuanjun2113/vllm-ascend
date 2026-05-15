@@ -15,6 +15,7 @@
 - **当** 读者评估 GDN prefix checkpoint 显存占用
 - **则** 分析必须根据模型的 linear-attention 层数、value-head 数量、value dimension、key dimension 与 SSM dtype 字节数，推导单个 GDN SSM checkpoint 的大小
 - **并且** 分析必须给出多个 checkpoint 间隔下摊销到每个 token 的开销
+- **并且** 分析必须说明固定间隔保存与用户可配置 anchor 保存策略对显存占用的影响
 
 #### Scenario: 估算 910B4 32G 容量
 
@@ -37,3 +38,4 @@
 - **则** 分析必须说明 OpenAI-compatible request 如何经过 chat template 形成最终 LLM 输入
 - **并且** 分析必须说明 Qwen3.6 chat template 中 tools 与 system prompt 对 prefix 稳定性的影响
 - **并且** 分析必须给出提高 Prefix Caching 命中率的 Agent 侧设计要求
+- **并且** 分析必须建议固定 tools 与 system prompt 场景使用 anchor checkpoint 策略，只在稳定前缀末尾保存一个 Linear Attention checkpoint

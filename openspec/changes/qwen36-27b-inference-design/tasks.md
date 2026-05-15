@@ -25,13 +25,14 @@
 ## 3. 910B4 推理实现与验证
 
 - [ ] 3.1 基于 Qwen3.6 模型类实现或调整 worker patch
-- [ ] 3.2 验证 910B4 x4、TP=4、FP16 eager baseline 正确性
+- [ ] 3.2 验证 910B4*4、TP=4、FP16 eager baseline 正确性
 - [ ] 3.3 验证 W8 动态量化加载、quant fusion 和输出精度
 - [ ] 3.4 启用 Chunk Prefill，验证 32K 输入下 prefill 正确性、显存峰值和调度行为
 - [ ] 3.5 启用 ACLGraph Full decode，验证 uniform decode batch 的 capture/replay 和 eager 路径切换
 - [ ] 3.6 接入 Qwen3.6 MTP，验证 draft、verify、accepted tokens、rejection sampling 和 GDN state 一致性
 - [ ] 3.7 启用 Prefix Cache，分别验证未命中、命中和关闭 Prefix Cache 的输出一致性
-- [ ] 3.8 验收 910 性能基线：启动 <= 8 min，关闭 Prefix Cache 时 32K 输入、10K 输出、TTFT <= 5000 ms、TPOT <= 20 ms/字符
+- [ ] 3.8 验收 910 阶段性能：记录 26.3 Qwen3 32B 对照基线；630 目标覆盖 8K/8K 并发 8、TTFT <= 2500 ms、TPOT <= 20 ms/字符，以及 32K/10K 并发 4、TTFT <= 8000 ms、TPOT <= 20 ms/字符
+- [ ] 3.9 验收 930 910 目标：关闭 Prefix Cache 时 8K/8K 并发 8、TTFT <= 2500 ms、TPOT <= 20 ms/字符；32K/10K 并发 4、TTFT <= 5000 ms、TPOT <= 20 ms/字符
 
 ## 4. 310P 已具备算子验证
 
@@ -50,7 +51,7 @@
 
 ## 6. 310P GDN 核心算子开发（SAIE）
 
-- [ ] 6.1 `chunk_gated_delta_rule_fwd 310P`：接收 SAIE AscendC kernel，注册 310P 算子，正确性测试 vs 910 Triton 实现
+- [ ] 6.1 `chunk_gated_delta_rule_fwd 310P`：接收 SAIE AscendC kernel，注册 310P 算子，正确性测试 vs 910 Triton 实现，并单独验证替换当前路径后 TTFT 是否降低约 40%
 - [ ] 6.2 `fused_sigmoid_gating_delta_rule_310`：接收 SAIE/NAIE AscendC kernel，注册 310P 融合算子，正确性测试 vs 分步实现
 - [ ] 6.3 在 `gdn_310.py` 中替换 PyTorch fallback 为双路径分发调用
 
@@ -69,10 +70,10 @@
 
 ## 9. 310P 推理验证与性能基线
 
-- [ ] 9.1 验证 300IDuo x2、TP=2、FP16 eager baseline 正确性
+- [ ] 9.1 验证 300IDuo*2、TP=2、FP16 eager baseline 正确性
 - [ ] 9.2 验证 310P W8 动态量化权重加载和输出精度
-- [ ] 9.3 性能 profiling：逐算子 latency 占比分析，确认整网耗时占比 <= 910 的 30%
-- [ ] 9.4 TPOT 基线测试：确认 310P 上 TPOT <= 60ms 目标
+- [ ] 9.3 性能 profiling：输出逐算子 latency 占比、瓶颈排序和优化建议
+- [ ] 9.4 验收 310P 阶段性能：记录 26.3 Qwen3 32B 对照基线；630 目标为 4K/4K 并发 2、TTFT <= 5000 ms、TPOT <= 80 ms/字符；930 目标为 4K/4K 并发 4、TTFT <= 4000 ms、TPOT <= 60 ms/字符
 - [ ] 9.5 投机推理端到端测试：310P rejection sampling + draft proposer 联合验证
 
 ## 10. 310P Chunk Prefill
@@ -89,13 +90,14 @@
 
 - [ ] 11.1 启用 `enable_prefix_caching=True`，验证 310P block allocator 和 hash 匹配
 - [ ] 11.2 实现 `SSMCheckpoint` 和 `SSMStatePool` 数据结构（LRU 淘汰）
-- [ ] 11.3 实现 SSM checkpoint 创建逻辑：每 128 tokens snapshot 48 层 GDN SSM state
+- [ ] 11.3 实现 SSM checkpoint 创建逻辑：支持固定间隔和用户可配置 `linearCheckpointPolicy`，默认不得突破全局显存上限
 - [ ] 11.4 实现 SSM checkpoint 恢复逻辑：以 hash(prefix_tokens) 查找并恢复 h 矩阵
 - [ ] 11.5 扩展 `get_computed_blocks()` 同时携带 matched SSM checkpoint
 - [ ] 11.6 在 `NPUModelRunner310.execute_model()` 中集成 SSM checkpoint 恢复
 - [ ] 11.7 验证 SSM checkpoint 间隔与 Full Attn block 边界对齐
 - [ ] 11.8 Prefix Cache 端到端正确性测试：KV cache block 复用 + GDN state 恢复
 - [ ] 11.9 Prefix Cache TTFT 性能测量：有命中 vs 无命中
+- [ ] 11.10 验证 anchor checkpoint 策略：固定 tools + system prompt 只保存一个 Linear Attention checkpoint，动态 user content 不创建 checkpoint，并对比显存占用和 TTFT
 
 ## 12. 310P MTP 投机推理
 
@@ -109,6 +111,7 @@
 - [ ] 12.8 验证 rejection sampling PyTorch fallback 系列算子正确性
 - [ ] 12.9 MTP 端到端正确性测试：draft + verify + rejection sampling
 - [ ] 12.10 MTP TPOT 性能测量 vs eager decode
+- [ ] 12.11 评估 MTP 增量优化方向：基于 acceptance rate 判断 Eagle3 直接训练收益，并分别评估 MTP 分支领域化微调、DFlash 使能和 DFlash 模型领域化微调
 
 ## 13. 310P 组合验收
 

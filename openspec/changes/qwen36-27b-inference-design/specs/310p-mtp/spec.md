@@ -80,6 +80,22 @@
 - **WHEN** MTP eager 路径的 acceptance rate 足够高
 - **THEN** 即使无 ACLGraph 加速，减少主模型 forward 次数的收益超过 eager 路径的额外 launch overhead
 
+### Requirement: MTP 增量优化方向
+
+系统 SHALL 在 Qwen3.6 MTP 后续优化评估中记录领域化微调和 DFlash 使能两类增量方向。
+
+#### Scenario: Eagle3 直接训练收益评估
+- **WHEN** Qwen3.6 MTP 接受率已经较高
+- **THEN** 直接训练 Eagle3 draft 模型不作为首选优化路径，验收报告 SHALL 记录该判断的 acceptance rate 依据。
+
+#### Scenario: MTP 分支领域化微调
+- **WHEN** 主模型微调已经包含 MTP
+- **THEN** 后续增量方案 SHOULD 评估对 MTP 分支单独使用领域化数据微调。
+
+#### Scenario: DFlash 领域化优化
+- **WHEN** 需要进一步提升投机步长和 draft/verify 执行速度
+- **THEN** 后续增量方案 SHOULD 评估使能 DFlash，并对 DFlash 模型进行领域化数据微调。
+
 ### Requirement: 310P Sampler MTP 兼容性
 
 `AscendSampler310` SHALL 正确处理 MTP 场景下的采样请求。

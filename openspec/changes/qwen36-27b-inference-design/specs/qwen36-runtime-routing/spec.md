@@ -24,3 +24,22 @@
 #### Scenario: 启动后检查路由结果
 - **WHEN** Qwen3.6-27B 实例完成启动
 - **THEN** 运维或测试 SHALL 能从日志或状态中确认该实例使用 Qwen3.6 候选版本组合和 `netrsnpython3rdadvance` 包。
+
+### Requirement: 模型元数据包承载投机推理启动配置
+系统 SHALL 通过模型元数据包的 `basic_configs.json` 承载投机推理启动级配置。
+
+#### Scenario: 读取 basic_configs.json 投机配置
+- **WHEN** Qwen3.6-27B 实例启动
+- **THEN** 外部服务或部署层 SHALL 从模型元数据包 `basic_configs.json` 读取 `speculative_config.method`、`speculative_config.model`、`speculative_config.draft_tensor_parallel_size`、`speculative_config.enforce_eager` 和 `speculative_config.num_speculative_tokens`，并转换为 vLLM/vllm-ascend 启动参数。
+
+#### Scenario: 禁止请求级覆盖投机配置
+- **WHEN** 请求携带与投机推理相关的运行时字段
+- **THEN** 系统 SHALL 不允许请求级参数覆盖 `basic_configs.json` 中的投机推理启动级配置。
+
+#### Scenario: 投机配置可观测
+- **WHEN** Qwen3.6-27B 实例完成启动
+- **THEN** 启动日志或部署状态 SHALL 输出最终生效的 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`。
+
+#### Scenario: 投机配置校验失败
+- **WHEN** `model`、`draft_tensor_parallel_size` 与主模型 TP、草稿模型权重或模型 revision 不一致
+- **THEN** 实例启动 SHALL 失败，并输出明确错误，不 SHALL 静默回退到默认投机配置。

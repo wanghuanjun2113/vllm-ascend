@@ -80,21 +80,29 @@
 - **WHEN** MTP eager 路径的 acceptance rate 足够高
 - **THEN** 即使无 ACLGraph 加速，减少主模型 forward 次数的收益超过 eager 路径的额外 launch overhead
 
-### Requirement: MTP 增量优化方向
+### Requirement: MTP 模型增训
 
-系统 SHALL 在 Qwen3.6 MTP 后续优化评估中记录领域化微调和 DFlash 使能两类增量方向。
+系统 SHALL 在 Qwen3.6 MTP 后续优化评估中记录 MTP/draft 分支领域化增训和 DFlash 领域化增训两类方案，并确保增训不修改主模型权重。
 
 #### Scenario: Eagle3 直接训练收益评估
 - **WHEN** Qwen3.6 MTP 接受率已经较高
 - **THEN** 直接训练 Eagle3 draft 模型不作为首选优化路径，验收报告 SHALL 记录该判断的 acceptance rate 依据。
 
-#### Scenario: MTP 分支领域化微调
+#### Scenario: MTP 分支领域化增训
 - **WHEN** 主模型微调已经包含 MTP
-- **THEN** 后续增量方案 SHOULD 评估对 MTP 分支单独使用领域化数据微调。
+- **THEN** 系统 SHALL 只对 MTP/draft 分支使用领域化数据增训，不修改主模型权重，并记录目标领域 acceptance rate、accepted tokens per step、TPOT 和端到端加速比。
 
-#### Scenario: DFlash 领域化优化
+#### Scenario: DFlash 领域化增训
 - **WHEN** 需要进一步提升投机步长和 draft/verify 执行速度
-- **THEN** 后续增量方案 SHOULD 评估使能 DFlash，并对 DFlash 模型进行领域化数据微调。
+- **THEN** 系统 SHALL 评估使能 DFlash，并对 DFlash 模型进行领域化数据增训，记录投机步长、draft/verify 耗时、acceptance rate 和端到端加速比。
+
+#### Scenario: 主模型推理效果不受影响
+- **WHEN** MTP/draft 分支完成领域化增训
+- **THEN** 非投机路径 SHALL 仍加载原主模型权重；开启 MTP 后最终输出 SHALL 与主模型 verify 结果对齐，不得因 draft 分支增训改变最终推理效果。
+
+#### Scenario: 非领域数据回归边界
+- **WHEN** 在非领域回归集上评估增训后的 MTP/draft 分支
+- **THEN** 投机接受率 MAY 小幅下降，但验收报告 SHALL 量化下降幅度，并证明最终输出质量不劣化。
 
 ### Requirement: 310P Sampler MTP 兼容性
 

@@ -8,6 +8,7 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 - 定义微服务 CR 参数到 vLLM/vllm-ascend/RTSP 包/镜像的动态路由契约；`NetrsnQwenLargeService` 与 `NetrsnQwenMoeMediumService` 未在当前仓库中找到实现，设计仅覆盖外部接口边界。
 - 规定 0.13.0 与 Qwen3.6 候选版本线双路径选型：0.13.0 支持 Qwen3.6 以外模型；Qwen3.6 候选版本线当前按 0.18.0 设计，但允许切换为 0.19.x.rcx，并新增 `netrsnpython3rdadvance` RTSP 包。
 - 规定 Qwen3.6 候选版本线运行态安全红线：不得依赖 GCC；wheel、AscendC `.so`、Triton cache 均需在构建期完成编译或预热。
+- 定义投机推理启动级接口：模型元数据包 `basic_configs.json` 承载 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`，请求级参数不得覆盖。
 
 ### 910 推理链路
 - 明确 910 推理链路：W8 动态量化、ACLGraph Full decode、Chunk Prefill、MTP、Prefix Cache 与 CoT 控制。
@@ -25,8 +26,8 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 - Prefix Caching：Full Attention block-level（复用 vLLM 框架）+ GDN SSM State Checkpoint（SSMStatePool 全新实现）
 - Linear Attention checkpoint 保存策略：开放用户接口按 `disabled`、`interval`、`anchor`、`auto` 配置保存行为；固定 tools/system prompt 场景可只保存一个 checkpoint，降低常驻显存
 - MTP 投机推理：Attention 后端 SpecDecoding 支持修复、`npu_copy_and_expand_eagle_inputs` PyTorch fallback、GDN multi-query 路径、rejection sampling PyTorch fallback
-- MTP 增量优化：Qwen3.6 MTP 接受率预期较高，直接训练 Eagle3 draft 模型收益有限；后续评估 MTP 分支领域化微调，以及 DFlash 使能与 DFlash 模型领域化微调
-- 明确阶段性能目标：300IDuo*2 单卡显存 96G；630 为 4K/4K 并发 2、TTFT <= 5000 ms、TPOT <= 80 ms/字符；930 为 4K/4K 并发 4、TTFT <= 4000 ms、TPOT <= 60 ms/字符；4 卡 300VPro 按同一基线验收。
+- MTP 模型增训：使用领域化数据增训 MTP/draft 分支或 DFlash 模型，提升目标领域接受率和加速比；不修改主模型权重，不影响最终推理效果；非领域数据接受率可小幅下降但必须量化
+- 明确阶段性能目标：300IDuo*2 单卡显存 96G；630 覆盖 4K/4K 并发 2（TTFT <= 5000 ms、TPOT <= 80 ms/字符）和 2K/2K 并发 4（TTFT <= 2500 ms、TPOT <= 70 ms/字符）；930 覆盖 4K/4K 并发 4（TTFT <= 4000 ms、TPOT <= 60 ms/字符）和 2K/2K 并发 4（TTFT <= 2000 ms、TPOT <= 55 ms/字符）；4 卡 300VPro 按同一基线验收。
 
 ### 混合注意力缓存优化（qwen36-hybrid-attn-cache-optimization）
 - 修改算子支持非连续 block 访问，消除 KV cache 和 GDN SSM state 之间的 padding blocks

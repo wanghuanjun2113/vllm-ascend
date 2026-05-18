@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: 310P 标准推理配置
-系统 SHALL 支持 Qwen3.6-27B 在 300IDuo*2、单卡显存 96G、TP=2 条件下运行，并覆盖 630 阶段并发 2 与 930 阶段并发 4 两类验收负载。
+系统 SHALL 支持 Qwen3.6-27B 在 300IDuo*2、单卡显存 96G、TP=2 条件下运行，并覆盖 4K/4K 与 2K/2K 两类 310 验收负载。
 
 #### Scenario: 310 标准实例启动
 - **WHEN** 使用 300IDuo*2 启动 Qwen3.6-27B 标准实例
@@ -18,13 +18,21 @@
 - **WHEN** 在裸机容器、300IDuo*2、Qwen3 32B、输入 4K、输出 4K、并发 2 条件下执行基线测试
 - **THEN** 验收报告 SHALL 记录 TTFT 5000 ms、TPOT 100 ms/字符。
 
-#### Scenario: 630 310 目标
+#### Scenario: 630 310 4K 目标
 - **WHEN** Prefix Cache 关闭、Qwen3.6 27B、输入长度为 4K、输出长度为 4K、并发为 2
 - **THEN** 系统 SHALL 达到 TTFT <= 5000 ms 且 TPOT <= 80 ms/字符。
 
-#### Scenario: 930 310 目标
+#### Scenario: 630 310 2K 目标
+- **WHEN** Prefix Cache 关闭、Qwen3.6 27B、输入长度为 2K、输出长度为 2K、并发为 4
+- **THEN** 系统 SHALL 达到 TTFT <= 2500 ms 且 TPOT <= 70 ms/字符。
+
+#### Scenario: 930 310 4K 目标
 - **WHEN** Prefix Cache 关闭、Qwen3.6 27B、输入长度为 4K、输出长度为 4K、并发为 4
 - **THEN** 系统 SHALL 达到 TTFT <= 4000 ms 且 TPOT <= 60 ms/字符。
+
+#### Scenario: 930 310 2K 目标
+- **WHEN** Prefix Cache 关闭、Qwen3.6 27B、输入长度为 2K、输出长度为 2K、并发为 4
+- **THEN** 系统 SHALL 达到 TTFT <= 2000 ms 且 TPOT <= 55 ms/字符。
 
 ### Requirement: 310 先交付 eager 正确性
 系统 MUST 先完成 310P eager 推理正确性，再启用 graph 推理。

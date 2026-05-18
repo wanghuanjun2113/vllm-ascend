@@ -46,7 +46,7 @@
 
 #### Scenario: MTP 增量优化方向
 - **WHEN** Qwen3.6 MTP 接受率已经较高
-- **THEN** 系统 SHOULD 优先评估 MTP 分支领域化数据微调，或使能 DFlash 并对 DFlash 模型进行领域化数据微调；直接训练 Eagle3 draft 模型不作为首选优化路径。
+- **THEN** 系统 SHOULD 优先评估 MTP/draft 分支领域化增训，或使能 DFlash 并对 DFlash 模型进行领域化增训；增训 SHALL 不修改主模型权重，不影响最终推理效果；直接训练 Eagle3 draft 模型不作为首选优化路径。
 
 ### Requirement: CoT 控制不进入 Ascend 执行语义
 系统 SHALL 通过 tokenizer/chat template 层控制 CoT 思考开关，不在 Ascend kernel、runner 或 sampler 中新增 CoT 专用语义。

@@ -33,6 +33,7 @@ Qwen3.6-27B 的推理交付同时受模型能力、硬件规格、版本打包�
 | 裸机容器 | Qwen3.6 27B | 910B4*4 | 8K | 8K | 8 | 2500 ms | 20 ms/字符 |
 | 裸机容器 | Qwen3.6 27B | 910B4*4 | 32K | 10K | 4 | 8000 ms | 20 ms/字符 |
 | 裸机容器 | Qwen3.6 27B | 300IDuo*2 | 4K | 4K | 2 | 5000 ms | 80 ms/字符 |
+| 裸机容器 | Qwen3.6 27B | 300IDuo*2 | 2K | 2K | 4 | 2500 ms | 70 ms/字符 |
 
 #### 930 达成目标
 
@@ -41,6 +42,7 @@ Qwen3.6-27B 的推理交付同时受模型能力、硬件规格、版本打包�
 | 裸机容器 | Qwen3.6 27B | 910B4*4 | 8K | 8K | 8 | 2500 ms | 20 ms/字符 |
 | 裸机容器 | Qwen3.6 27B | 910B4*4 | 32K | 10K | 4 | 5000 ms | 20 ms/字符 |
 | 裸机容器 | Qwen3.6 27B | 300IDuo*2 | 4K | 4K | 4 | 4000 ms | 60 ms/字符 |
+| 裸机容器 | Qwen3.6 27B | 300IDuo*2 | 2K | 2K | 4 | 2000 ms | 55 ms/字符 |
 
 2 张 300VPro 等价于 1 张 300IDuo；4 卡 300VPro 同样适用 300IDuo*2 的性能基线。Prefix Cache 的收益不得用于替代关闭 Prefix Cache 的阶段验收基线。开启 Prefix Cache 后单独验收命中率、TTFT 改善和输出一致性。
 
@@ -152,7 +154,44 @@ Qwen3.6 当前按 0.18.0 包线设计；后续若产品选择 0.19.x.rcx，则 0
 - Triton 路径若参与 910 推理，必须在构建期预热 cache 或在安全认可的非运行态阶段生成。
 - 启动脚本在运行态只允许加载包、选择配置、启动服务，不允许触发源码编译。
 
-### 4. 910 推理方案
+### 4. 接口设计
+
+#### 4.1 投机推理启动级配置
+
+投机推理涉及的配置参数均为启动级参数，不支持请求级动态切换。配置通过模型元数据包中的 `basic_configs.json` 承载，由外部服务或部署层读取后转换为 vLLM/vllm-ascend 启动参数。当前仓库未包含模型元数据包解析实现，因此本设计只定义接口契约和校验要求。
+
+`basic_configs.json` 中投机推理配置建议结构如下：
+
+```json
+{
+  "speculative_config": {
+    "method": "mtp",
+    "model": "path-or-model-id-of-draft-model",
+    "draft_tensor_parallel_size": 1,
+    "enforce_eager": false,
+    "num_speculative_tokens": 4
+  }
+}
+```
+
+字段约束：
+
+| 字段 | 含义 | 约束 |
+|---|---|---|
+| `method` | 投机推理方法 | Qwen3.6 首选 `mtp`；需映射到 vllm-ascend `spec_decode` 分发路径 |
+| `model` | 草稿模型或 MTP 权重路径 | 必须随模型元数据包版本化，且与主模型 revision 明确绑定 |
+| `draft_tensor_parallel_size` | 草稿模型 TP 数 | 必须与目标硬件和草稿模型权重切分一致 |
+| `enforce_eager` | 是否强制 eager 执行 | 用于规避 graph capture 不稳定场景；310P 首阶段可使用 eager 路径 |
+| `num_speculative_tokens` | 每一步尝试投机的最大草稿 token 数 | 需结合接受率、显存、draft/verify 耗时和端到端 TPOT 调优 |
+
+接口边界：
+
+- `basic_configs.json` 是启动级配置来源；请求级参数不得覆盖上述投机推理字段。
+- 服务启动日志或部署状态必须输出最终生效的 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`。
+- `method=mtp` 时，运行时必须进入 `vllm_ascend/spec_decode/__init__.py` 的通用 MTP 分发，再由 `AscendEagleProposer` 承载 draft/verify。
+- `model`、`draft_tensor_parallel_size` 与主模型 TP、权重 revision 不一致时，实例启动必须失败，不能退化为隐式默认值。
+
+### 5. 910 推理方案
 
 910 标准交付配置：
 
@@ -168,10 +207,24 @@ ACLGraph 约束来自 `ACLGraphWrapper`：capture/replay 依赖稳定的 batch d
 
 MTP 约束来自 `model_runner_v1.py` 和 `eagle_proposer.py`：spec decode 会改变 draft token、logits indices、GDN metadata、accepted token 和 rejection sampling 链路。Qwen3.6 接入时必须验证 GDN `spec_token_indx`、SSM state indices、accepted token 数量与 full graph capture size 一致。
 
-MTP 增量优化不以直接训练 Eagle3 draft 模型作为首选路径。原因是 Qwen3.6 MTP 接受率预期较高，单独训练 Eagle3 模型的边际收益有限。可评估的增量方向包括：
+#### MTP 模型增训
 
-1. 在主模型微调已带 MTP 的基础上，对 MTP 分支单独使用领域化数据微调。
-2. 使能 DFlash，提高投机步长和 draft/verify 执行速度，并对 DFlash 模型进行领域化数据微调。
+MTP 增训目标是在不修改主模型权重的前提下，使用领域化数据对 MTP/draft 分支进行增量训练，使目标领域场景下的投机接受率更高、主模型调用次数更少、端到端加速比更高。
+
+基本判断：Qwen3.6 MTP 接受率预期较高，直接训练 Eagle3 draft 模型的边际收益有限，首选优化方向应聚焦既有 MTP 分支或 DFlash 路径。
+
+可评估的增量方案：
+
+1. **MTP 分支领域化增训**：在主模型微调已带 MTP 的基础上，仅对 MTP 分支使用领域化数据微调。
+2. **DFlash 领域化增训**：使能 DFlash，提高投机步长和 draft/verify 执行速度，并对 DFlash 模型进行领域化数据微调。
+
+硬约束：
+
+- 不修改主模型权重。
+- 不改变非投机路径的推理结果。
+- MTP verify 后最终 accepted tokens 必须与主模型目标分布对齐，不能因 draft 分支增训影响模型推理效果。
+
+可接受影响：非领域数据上的投机接受率可以小幅下降，但必须在回归报告中量化；非领域数据的最终输出质量不得劣化。
 
 #### 极低时延方案
 
@@ -187,7 +240,7 @@ MTP 增量优化不以直接训练 Eagle3 draft 模型作为首选路径。原�
 | TTFT | <= 1.5 s | Prefix Cache 命中场景 |
 | TPOT | <= 10 ms/token | MTP、Full decode graph 与量化优化叠加 |
 
-### 5. 310 推理方案
+### 6. 310 推理方案
 
 310 标准交付配置：
 
@@ -196,7 +249,7 @@ MTP 增量优化不以直接训练 Eagle3 draft 模型作为首选路径。原�
 - 首个交付底座：eager correctness。
 - Graph：在 CANN/torch_npu 对 310P graph 能力确认后分阶段启用。
 
-#### 5.1 算子补齐
+#### 6.1 算子补齐
 
 310P 第一阶段目标是补齐 Qwen3.6-27B 推理所需的关键算子，先保证 GDN、MRoPE、KV 转置等路径具备可验证的正确性和基础性能。
 
@@ -275,7 +328,7 @@ GDN 算子的参数构造存在系统性差异：
 - **mask 格式**：910 使用 `sparse_mode=3` 跳过 mask 生成，310P 需物化完整 NZ 格式 causal mask
 - **run_mode**：910 通过选择不同函数区分 prefill/decode，310P 单一算子通过 `run_mode` 参数区分
 
-#### 5.2 关键特性适配
+#### 6.2 关键特性适配
 
 310P 第二/三阶段目标是在算子路径稳定后启用关键推理特性。三个特性逐项启用、验证、再组合。
 
@@ -315,7 +368,7 @@ linearCheckpointPolicy:
 - **`npu_copy_and_expand_eagle_inputs`**：当前仅 910 注册，310P 需 PyTorch fallback（推荐先用 PyTorch 保底正确性）
 - **GDN multi-query 路径**：已在 `gdn_310.py` 中通过 `spec_sequence_masks` 分支实现
 - **Rejection Sampling**：PyTorch fallback 已在 `rejection_sampler.py` 中实现，通过 `HAS_TRITON` 自动选择
-- **增量优化方向**：Qwen3.6 MTP 接受率预期较高，直接训练 Eagle3 draft 模型收益有限；后续优先评估 MTP 分支领域化微调，或使能 DFlash 并对 DFlash 模型做领域化数据微调
+- **MTP 模型增训**：目标是在不影响主模型权重和最终推理效果的前提下，通过领域化数据提升目标领域的投机接受率和加速比；允许非领域数据接受率小幅下降，但需量化并确认最终输出质量不劣化
 
 **特性使能顺序**：
 
@@ -350,17 +403,17 @@ Graph 推进顺序：
 3. GDN state 双缓冲或 input/output state 拆分，解决 inplace state 更新和地址稳定性。
 4. 全模型 graph + spec decode graph。
 
-### 6. 混合注意力缓存优化
+### 7. 混合注意力缓存优化
 
 Qwen3.6 27B 使用 Full Attention (16 层) + Linear Attention/GDN (48 层) 混合注意力架构。当前实现中，Full Attention KV Cache 和 GDN SSM State 共享同一个 `kv_cache_tensor`。为保持共享张量的连续性，代码通过膨胀 block_size（128→1536）和添加 padding 实现统一 page_size，导致显著显存浪费。
 
-#### 6.1 显存浪费来源
+#### 7.1 显存浪费来源
 
 - **conv_block_page_size padding**：每 block 27 KiB，总 padding 约 309 MiB
 - **block_size 膨胀碎片化**：block_size 从 128 膨胀到 1536，KVCacheManager 分配粒度为 1536 tokens/block
 - **统一 page_size 限制灵活性**：KV cache 自然 page_size 128 KiB vs SSM state 自然 page_size 795 KiB，强制统一后 KV cache 利用率仅 8.2%
 
-#### 6.2 优化方案：同一 Pool 内非连续布局
+#### 7.2 优化方案：同一 Pool 内非连续布局
 
 保持共享 `kv_cache_tensor`，划分为三个独立连续子区域：
 
@@ -376,7 +429,7 @@ kv_cache_tensor 布局:
 
 关键洞察：CANN attention 算子（`npu_fused_infer_attention_score`、`npu_paged_attention`）通过 `block_table` 间接寻址，算子本身不假设 block 连续。只要 `block_table` 中的 physical block number 正确反映新布局中的偏移，算子无需修改。
 
-#### 6.3 需要修改的代码路径
+#### 7.3 需要修改的代码路径
 
 | 文件 | 改动 |
 |------|------|
@@ -386,16 +439,16 @@ kv_cache_tensor 布局:
 | `worker/model_runner_v1.py:3043-3084` | `_reshape_kv_cache_tensors` 按子区域切片 |
 | `worker/block_table.py` | slot_mapping 计算需考虑 KV region 起始 offset |
 
-### 7. KV Cache 容量分析与池化
+### 8. KV Cache 容量分析与池化
 
-#### 7.1 单 Token Cache/State 开销
+#### 8.1 单 Token Cache/State 开销
 
 - **Full Attention KV cache**：64 KiB/token（TP=4，16 层 × 2 × 4 KV heads × 256 head_dim × 2 bytes）
 - **TP=8 复制**：Full Attention 4 个 KV heads < TP size，物理分配 128 KiB/token
 - **GDN SSM state**：144 MiB/checkpoint（48 层 × 48 value heads × 128 × 128 × 4 bytes float32）
 - **Checkpoint 间隔影响**：128-token 间隔时 linear checkpoint 为 1.125 MiB/token（是 Full KV 的 18 倍），1024-token 间隔时降为 144 KiB/token
 
-#### 7.2 HBM 容量预算（910B4 32G）
+#### 8.2 HBM 容量预算（910B4 32G）
 
 实测四卡部署单卡可用 KVCache 17.48 GiB，总预算 69.92 GiB。
 
@@ -407,7 +460,7 @@ kv_cache_tensor 布局:
 
 关键结论：TP=8 不能简单按 TP=4 容量翻倍。由于 Full Attention 4 个 KV heads 复制，不保存 GDN checkpoint 时 TP=4 和 TP=8 最大 tokens 基本相同。
 
-#### 7.3 DRAM 池化方案
+#### 8.3 DRAM 池化方案
 
 单台 910B4 上部署 2 个 TP=4 PD 混合实例，共享 1 个 Mooncake DRAM KV Cache Pool。
 
@@ -422,7 +475,7 @@ kv_cache_tensor 布局:
 
 建议先支持 Full KV 池化，再逐步加入 GDN checkpoint。checkpoint 间隔优先评估 4,096 或 8,192 tokens。
 
-#### 7.4 Linear Attention Checkpoint 保存策略
+#### 8.4 Linear Attention Checkpoint 保存策略
 
 Linear Attention checkpoint 单点开销高，固定每 128 tokens 保存会显著压缩可缓存 token 数。保存策略应从“按固定 block 全量保存”扩展为“按用户可声明的稳定前缀保存”。
 
@@ -437,11 +490,11 @@ Linear Attention checkpoint 单点开销高，固定每 128 tokens 保存会显�
 
 Agent 默认建议使用 `anchor` 策略：固定 tools 与 system prompt 只保存一个 checkpoint，动态用户输入不创建 checkpoint。该策略减少 linear checkpoint 常驻显存，同时保留稳定前缀复用收益。
 
-#### 7.5 TTFT 收益
+#### 8.5 TTFT 收益
 
 实测 64K 输入 90% DRAM cache 命中：TTFT 从 38.3s 降至 14.4s，相对下降 62.4%，加速比 2.66x。纯数据搬运理论量级为几十到百毫秒，主要收益来自避免大部分 prefill 计算。
 
-#### 7.6 Agent 请求设计指导
+#### 8.6 Agent 请求设计指导
 
 Prefix Caching 命中的是最终渲染后的 token 前缀，不是 OpenAI request JSON 的语义。Agent 设计优先级：
 
@@ -451,7 +504,7 @@ Prefix Caching 命中的是最终渲染后的 token 前缀，不是 OpenAI reque
 
 网关按 `prefix_profile_key = model_id + tokenizer_revision + chat_template_version + tool_schema_version + system_prompt_version + thinking_mode + tenant_cache_namespace` 路由。
 
-### 8. 精度、Profiling 与性能闭环
+### 9. 精度、Profiling 与性能闭环
 
 验证顺序：
 

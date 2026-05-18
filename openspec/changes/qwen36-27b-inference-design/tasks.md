@@ -21,6 +21,7 @@
 - [ ] 2.3 在外部微服务或部署层输出最终 vLLM 版本、vllm-ascend 版本、RTSP 包名和镜像标签
 - [ ] 2.4 为 Qwen3.6 候选版本线构建预编译 wheel、AscendC `.so` 和必要 Triton cache，确保运行态不触发源码编译
 - [ ] 2.5 对 Qwen3.6 候选版本线镜像或 RTSP 包执行运行态依赖扫描，证明无 GCC 依赖
+- [ ] 2.6 定义并验证模型元数据包 `basic_configs.json` 中的 `speculative_config` 启动级接口，覆盖 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`
 
 ## 3. 910B4 推理实现与验证
 
@@ -73,7 +74,7 @@
 - [ ] 9.1 验证 300IDuo*2、TP=2、FP16 eager baseline 正确性
 - [ ] 9.2 验证 310P W8 动态量化权重加载和输出精度
 - [ ] 9.3 性能 profiling：输出逐算子 latency 占比、瓶颈排序和优化建议
-- [ ] 9.4 验收 310P 阶段性能：记录 26.3 Qwen3 32B 对照基线；630 目标为 4K/4K 并发 2、TTFT <= 5000 ms、TPOT <= 80 ms/字符；930 目标为 4K/4K 并发 4、TTFT <= 4000 ms、TPOT <= 60 ms/字符
+- [ ] 9.4 验收 310P 阶段性能：记录 26.3 Qwen3 32B 对照基线；630 目标为 4K/4K 并发 2、TTFT <= 5000 ms、TPOT <= 80 ms/字符，以及 2K/2K 并发 4、TTFT <= 2500 ms、TPOT <= 70 ms/字符；930 目标为 4K/4K 并发 4、TTFT <= 4000 ms、TPOT <= 60 ms/字符，以及 2K/2K 并发 4、TTFT <= 2000 ms、TPOT <= 55 ms/字符
 - [ ] 9.5 投机推理端到端测试：310P rejection sampling + draft proposer 联合验证
 
 ## 10. 310P Chunk Prefill
@@ -111,7 +112,7 @@
 - [ ] 12.8 验证 rejection sampling PyTorch fallback 系列算子正确性
 - [ ] 12.9 MTP 端到端正确性测试：draft + verify + rejection sampling
 - [ ] 12.10 MTP TPOT 性能测量 vs eager decode
-- [ ] 12.11 评估 MTP 增量优化方向：基于 acceptance rate 判断 Eagle3 直接训练收益，并分别评估 MTP 分支领域化微调、DFlash 使能和 DFlash 模型领域化微调
+- [ ] 12.11 评估 MTP 模型增训：基于 acceptance rate 判断 Eagle3 直接训练收益，分别评估 MTP/draft 分支领域化增训、DFlash 使能和 DFlash 模型领域化增训，确认不修改主模型权重、不影响最终推理效果，并量化非领域数据接受率变化
 
 ## 13. 310P 组合验收
 

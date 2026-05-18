@@ -209,22 +209,26 @@ MTP 约束来自 `model_runner_v1.py` 和 `eagle_proposer.py`：spec decode 会�
 
 #### MTP 模型增训
 
-MTP 增训目标是在不修改主模型权重的前提下，使用领域化数据对 MTP/draft 分支进行增量训练，使目标领域场景下的投机接受率更高、主模型调用次数更少、端到端加速比更高。
+MTP 领域增训采用非侵入式微调范式：训练阶段冻结主模型全部参数，包括 embedding、主干 Attention/GDN 层和 LM head，仅将 MTP 投机预测头或 DFlash draft 模型作为可训练组件。训练数据使用高质量领域样本，例如特定代码库、专有业务逻辑、固定工具集合或固定版式 Agent 对话，使 draft 分支的概率分布更贴合目标业务场景。
+
+目标是在不修改主模型权重的前提下，提高目标领域场景的投机接受率、单次主模型 forward 可接受 token 数和端到端加速比。核心指标包括 acceptance rate、accepted tokens per step、draft/verify 耗时、TPOT 和 E2E latency。
 
 基本判断：Qwen3.6 MTP 接受率预期较高，直接训练 Eagle3 draft 模型的边际收益有限，首选优化方向应聚焦既有 MTP 分支或 DFlash 路径。
 
 可评估的增量方案：
 
-1. **MTP 分支领域化增训**：在主模型微调已带 MTP 的基础上，仅对 MTP 分支使用领域化数据微调。
-2. **DFlash 领域化增训**：使能 DFlash，提高投机步长和 draft/verify 执行速度，并对 DFlash 模型进行领域化数据微调。
+1. **MTP 分支领域化增训**：在主模型微调已带 MTP 的基础上，仅对 MTP 分支使用领域化数据增训，提升目标领域 token 预测命中率。
+2. **DFlash 领域化增训**：使能 DFlash，提高投机步长和 draft/verify 执行速度，并对 DFlash 模型进行领域化数据增训。
 
 硬约束：
 
 - 不修改主模型权重。
 - 不改变非投机路径的推理结果。
-- MTP verify 后最终 accepted tokens 必须与主模型目标分布对齐，不能因 draft 分支增训影响模型推理效果。
+- MTP 模块只负责 draft 候选 token，最终 verify 与采样仲裁仍由主模型完成。
+- 拒绝采样必须保证：draft token 被主模型拒绝时回退到主模型生成路径，最终输出与全量自回归主模型推理保持一致或满足业务定义的等价阈值。
+- 增训产物必须与主模型 revision 绑定，避免 draft 权重与主模型权重版本不一致。
 
-可接受影响：非领域数据上的投机接受率可以小幅下降，但必须在回归报告中量化；非领域数据的最终输出质量不得劣化。
+收益目标是非对称优化：在目标领域数据上提升 acceptance rate 和 accepted tokens per step，降低单位 token 生成成本；在非领域数据上允许投机接受率小幅下降，但必须在回归报告中量化。该下降只能表现为推理速度接近基线，不得导致最终输出质量劣化。
 
 #### 极低时延方案
 

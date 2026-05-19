@@ -17,10 +17,10 @@
 ## 2. Runtime Routing 与打包
 
 - [ ] 2.1 定义 `spec.vllmVersion=0.13.0` 到 0.13.0 vLLM/vllm-ascend、`netrsnpython3rd` 和既有模型镜像的路由规则
-- [ ] 2.2 定义 `spec.vllmVersion=0.18.0` 或 `0.19.x.rcx` 到 Qwen3.6 候选 vLLM/vllm-ascend、`netrsnpython3rdadvance` 和 Qwen3.6 镜像的路由规则
+- [ ] 2.2 定义 Qwen3.6-27B 到 0.19.1+ vLLM/vllm-ascend、`netrsnpython3rdadvance` 和 Qwen3.6 镜像的路由规则，并记录 `v0.19.1rc1` RC 版本风险
 - [ ] 2.3 在外部微服务或部署层输出最终 vLLM 版本、vllm-ascend 版本、RTSP 包名和镜像标签
-- [ ] 2.4 为 Qwen3.6 候选版本线构建预编译 wheel、AscendC `.so` 和必要 Triton cache，确保运行态不触发源码编译
-- [ ] 2.5 对 Qwen3.6 候选版本线镜像或 RTSP 包执行运行态依赖扫描，证明无 GCC 依赖
+- [ ] 2.4 为 Qwen3.6 0.19.1+ 版本线构建预编译 wheel、AscendC `.so` 和必要 Triton cache，确保运行态不触发源码编译
+- [ ] 2.5 对 Qwen3.6 0.19.1+ 版本线镜像或 RTSP 包执行运行态依赖扫描，证明无 GCC 依赖
 - [ ] 2.6 定义并验证模型元数据包 `basic_configs.json` 中的 `speculative_config` 启动级接口，覆盖 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`
 
 ## 3. 910B4 推理实现与验证

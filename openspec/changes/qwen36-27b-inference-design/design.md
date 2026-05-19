@@ -67,7 +67,7 @@ Qwen3.6-27B 的推理交付同时受模型能力、硬件规格、版本打包�
 **Goals:**
 
 - 给出 Qwen3.6-27B 在 910B4*4 与 300IDuo*2 上的可实施推理设计。
-- 明确 0.13.0 与 Qwen3.6 候选版本线的路由和 RTSP 包选择规则。
+- 明确 0.13.0 与 Qwen3.6 0.19.1+ 版本线的路由和 RTSP 包选择规则。
 - 明确 310P 算子开发状态、接口定义和 310P 集成方案，涵盖 GDN 核心、QKV/RoPE、注意力/投机推理四领域。
 - 明确 310P Chunk Prefill、Prefix Caching、MTP 三个关键特性的 910/310P 可共用部分和 310P 独有适配工作。
 - 明确混合注意力缓存优化方案：非连续布局、消除 padding、恢复 block_size=128。
@@ -136,23 +136,18 @@ Qwen3.6-27B 的推理交付同时受模型能力、硬件规格、版本打包�
 
 ### 3. 版本与打包设计
 
-版本选择规则：
+#### 3.1 vLLM/vllm-ascend 版本选择
 
-| CR 字段 | vLLM/vllm-ascend | RTSP 包 | 模型范围 |
-|---|---|---|---|
-| `spec.vllmVersion=0.13.0` | 0.13.0 版本组合 | `netrsnpython3rd` | Qwen3.6 以外既有模型 |
-| `spec.vllmVersion=0.18.0` | 0.18.0 版本组合 | `netrsnpython3rdadvance` | Qwen3.6-27B |
-| `spec.vllmVersion=0.19.x.rcx` | 0.19.x.rcx 候选版本组合 | `netrsnpython3rdadvance` | Qwen3.6-27B 备选路径 |
+| vLLM/vllm-ascend | RTSP 包 | 模型范围 |
+|---|---|---|
+| 0.13.0 版本 | `netrsnpython3rd` | 旧模型 |
+| 0.19.1+ 版本 | `netrsnpython3rdadvance` | Qwen3.6-27B |
 
-Qwen3.6 当前按 0.18.0 包线设计；后续若产品选择 0.19.x.rcx，则 0.18.0 路径整体替换为 0.19.x.rcx 路径。除 vLLM/vllm-ascend 版本组合与镜像标签外，RTSP 包、安全扫描、GCC 红线和性能验收要求保持不变。
+vllm-ascend 的 0.19.1+ 版本当前只有 `v0.19.1rc1` RC 版本，存在版本稳定性风险。该判断以 vllm-ascend release 页面为准：https://github.com/vllm-project/vllm-ascend/releases 。
 
-0.18.0 包线以及后续可能替换的 0.19.x.rcx 包线必须满足：
+部署Qwen3.6模型的微服务新增对netrsnpython3rdadvance RTSP包的依赖。因此当产品部署Qwen3.6模型时需要新增集成RTSP包netrsnpython3rdadvance。
 
-- 运行态不安装、不调用 GCC。
-- vllm、vllm-ascend、torch-npu、CANN 依赖以 wheel 或系统基础镜像形式提前固化。
-- AscendC 自定义算子以 `.so` 交付，构建期完成编译。
-- Triton 路径若参与 910 推理，必须在构建期预热 cache 或在安全认可的非运行态阶段生成。
-- 启动脚本在运行态只允许加载包、选择配置、启动服务，不允许触发源码编译。
+大模型微服务依据CR参数做判断是使用vllm/vllm-ascend版本0.13.0，还是使用vllm/vllm-ascend的高版本，从而做不同的加载。
 
 ### 4. 接口设计
 
@@ -184,12 +179,7 @@ Qwen3.6 当前按 0.18.0 包线设计；后续若产品选择 0.19.x.rcx，则 0
 | `enforce_eager` | 是否强制 eager 执行 | 用于规避 graph capture 不稳定场景；310P 首阶段可使用 eager 路径 |
 | `num_speculative_tokens` | 每一步尝试投机的最大草稿 token 数 | 需结合接受率、显存、draft/verify 耗时和端到端 TPOT 调优 |
 
-接口边界：
 
-- `basic_configs.json` 是启动级配置来源；请求级参数不得覆盖上述投机推理字段。
-- 服务启动日志或部署状态必须输出最终生效的 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`。
-- `method=mtp` 时，运行时必须进入 `vllm_ascend/spec_decode/__init__.py` 的通用 MTP 分发，再由 `AscendEagleProposer` 承载 draft/verify。
-- `model`、`draft_tensor_parallel_size` 与主模型 TP、权重 revision 不一致时，实例启动必须失败，不能退化为隐式默认值。
 
 ### 5. 910 推理方案
 
@@ -541,7 +531,8 @@ Profiling 分段：
 
 - [Qwen3.6 最终结构未确认] -> 前置调研必须确认 `config.json`、模型类、GDN 参数和 MTP head。
 - [外部微服务不在仓库内] -> 文档只定义 CR 路由契约和验收输出。
-- [Qwen3.6 候选版本线运行态 GCC 红线] -> 所有编译动作前移到构建期。
+- [Qwen3.6 0.19.1+ 版本线运行态 GCC 红线] -> 所有编译动作前移到构建期。
+- [vllm-ascend 0.19.1+ RC 版本风险] -> 当前仅 `v0.19.1rc1` 可用，需在灰度和验收阶段重点验证稳定性。
 - [SAIE 算子交付节奏] -> `chunk_gated_delta_rule_fwd` 和 `fused_sigmoid_gating_delta_rule_310` 交付时间直接影响 310P 性能。缓解：PyTorch fallback 保底正确性。
 - [NAIE 高优先级算子开发周期] -> `fused_gdn_gating` 和 `mRope` 依赖 NAIE 团队排期。缓解：明确接口规范，提前对齐。
 - [310P AICore 架构差异] -> AscendC kernel 移植需重新调整 tiling 参数。缓解：参考已有 310P 适配经验。
@@ -556,12 +547,12 @@ Profiling 分段：
 
 ## Migration Plan
 
-1. 新建 Qwen3.6 候选版本线专用镜像和 `netrsnpython3rdadvance` 包，不影响 0.13.0 既有模型路径。
-2. 在灰度环境按 CR `spec.vllmVersion=0.18.0` 或 `0.19.x.rcx` 路由 Qwen3.6 实例。
+1. 新建 Qwen3.6 0.19.1+ 版本线专用镜像和 `netrsnpython3rdadvance` 包，不影响 0.13.0 既有模型路径。
+2. 在灰度环境按产品 CR 路由 Qwen3.6 实例到 0.19.1+ vLLM/vllm-ascend 和 `netrsnpython3rdadvance`。
 3. 先启用 FP16 eager，随后逐项启用 W8 动态量化、Chunk Prefill、ACLGraph、Prefix Cache、MTP。
 4. 310P 按 Phase 1-4 顺序推进：算子补齐 → eager 正确性 → 关键特性使能 → 组合验收。
 5. 缓存优化在 310P 算子稳定后执行，按子区域布局迁移，对比新旧 layout 的 attention 输出一致性。
-6. 若 Qwen3.6 候选版本线运行态依赖或性能不达标，通过 CR 切换到 0.13.0 路径或禁用 Qwen3.6 实例。
+6. 若 Qwen3.6 0.19.1+ 版本线运行态依赖或性能不达标，通过 CR 切换到 0.13.0 路径或禁用 Qwen3.6 实例。
 
 ## Open Questions
 

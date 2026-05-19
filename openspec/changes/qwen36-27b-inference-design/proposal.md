@@ -6,8 +6,8 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 
 ### Runtime Routing 与打包
 - 定义微服务 CR 参数到 vLLM/vllm-ascend/RTSP 包/镜像的动态路由契约；`NetrsnQwenLargeService` 与 `NetrsnQwenMoeMediumService` 未在当前仓库中找到实现，设计仅覆盖外部接口边界。
-- 规定 0.13.0 与 Qwen3.6 候选版本线双路径选型：0.13.0 支持 Qwen3.6 以外模型；Qwen3.6 候选版本线当前按 0.18.0 设计，但允许切换为 0.19.x.rcx，并新增 `netrsnpython3rdadvance` RTSP 包。
-- 规定 Qwen3.6 候选版本线运行态安全红线：不得依赖 GCC；wheel、AscendC `.so`、Triton cache 均需在构建期完成编译或预热。
+- 规定 0.13.0 与 0.19.1+ 双路径选型：0.13.0 支持旧模型；0.19.1+ 支持 Qwen3.6-27B，并新增 `netrsnpython3rdadvance` RTSP 包。
+- 记录 0.19.1+ 当前只有 `v0.19.1rc1` RC 版本的稳定性风险，并规定 Qwen3.6 0.19.1+ 版本线运行态安全红线：不得依赖 GCC；wheel、AscendC `.so`、Triton cache 均需在构建期完成编译或预热。
 - 定义投机推理启动级接口：模型元数据包 `basic_configs.json` 承载 `method`、`model`、`draft_tensor_parallel_size`、`enforce_eager` 和 `num_speculative_tokens`，请求级参数不得覆盖。
 
 ### 910 推理链路
@@ -49,7 +49,7 @@ Qwen3.6-27B 需要在 Ascend 910B4 与 300IDuo 两类硬件上形成可验收的
 
 ### New Capabilities
 
-- `qwen36-runtime-routing`: 产品 CR 参数驱动 vLLM/vllm-ascend/RTSP 包/镜像选择，覆盖 0.13.0 与 Qwen3.6 候选版本线
+- `qwen36-runtime-routing`: 产品 CR 参数驱动 vLLM/vllm-ascend/RTSP 包/镜像选择，覆盖 0.13.0 与 0.19.1+
 - `qwen36-910-inference`: Qwen3.6-27B 在 910B4*4 上的推理配置、优化特性和性能验收
 - `qwen36-310p-inference`: Qwen3.6-27B 在 300IDuo*2 上的 eager/graph 推理路径、算子要求和性能验收
 - `qwen36-quantization-accuracy`: FP16 baseline、W8 动态量化、CoT/MTP/Prefix Cache 组合下的精度对齐和 Profiling 闭环

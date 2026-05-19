@@ -284,6 +284,7 @@ MTP 领域增训采用非侵入式微调范式：训练阶段冻结主模型全�
 - block_size 受 `block_size * head_size <= 128*128` 约束
 - 当前仅 eager 模式
 - 算子注册通过 `#ifdef ASCEND_PLATFORM_310P` 编译时条件选择
+- CANN 配套存在集成风险：上述新增和迁移算子最终必须统一适配到同一个目标 CANN 版本，可能涉及接口、tiling、编译选项和精度/性能回归的多轮适配工作
 
 **算子集成架构**：
 
@@ -536,6 +537,7 @@ Profiling 分段：
 - [SAIE 算子交付节奏] -> `chunk_gated_delta_rule_fwd` 和 `fused_sigmoid_gating_delta_rule_310` 交付时间直接影响 310P 性能。缓解：PyTorch fallback 保底正确性。
 - [NAIE 高优先级算子开发周期] -> `fused_gdn_gating` 和 `mRope` 依赖 NAIE 团队排期。缓解：明确接口规范，提前对齐。
 - [310P AICore 架构差异] -> AscendC kernel 移植需重新调整 tiling 参数。缓解：参考已有 310P 适配经验。
+- [CANN 配套版本统一风险] -> 310P 新增和迁移算子最终需统一适配到同一个目标 CANN 版本，可能产生多轮接口、tiling、编译和回归适配工作。缓解：提前冻结目标 CANN/torch-npu 版本，建立算子级兼容性矩阵。
 - [Attention 后端 SpecDecoding 改动量] -> `AscendAttentionBackend310` 需新增 Draft/Verify 路径。缓解：参考 910 实现。
 - [MTP + GDN state 交互复杂] -> 先验证非 MTP，再验证 MTP eager，最后叠加 full graph。
 - [SSMStatePool 显存管理] -> 每个 checkpoint 144 MiB。缓解：LRU 淘汰 + max_checkpoints 上限。

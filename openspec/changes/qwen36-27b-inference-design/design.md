@@ -169,15 +169,15 @@ vllm-ascend 的 0.19.1+ 版本当前只有 `v0.19.1rc1` RC 版本，存在版本
 }
 ```
 
-字段约束：
+各字段说明如下：
 
-| 字段 | 含义 | 约束 |
+| 字段 | 类型 | 含义 |
 |---|---|---|
-| `method` | 投机推理方法 | Qwen3.6 首选 `mtp`；需映射到 vllm-ascend `spec_decode` 分发路径 |
-| `model` | 草稿模型或 MTP 权重路径 | 必须随模型元数据包版本化，且与主模型 revision 明确绑定 |
-| `draft_tensor_parallel_size` | 草稿模型 TP 数 | 必须与目标硬件和草稿模型权重切分一致 |
-| `enforce_eager` | 是否强制 eager 执行 | 用于规避 graph capture 不稳定场景；310P 首阶段可使用 eager 路径 |
-| `num_speculative_tokens` | 每一步尝试投机的最大草稿 token 数 | 需结合接受率、显存、draft/verify 耗时和端到端 TPOT 调优 |
+| `method` | string | 选择使用的投机推理方法。 |
+| `model` | string | 草稿模型（draft model）的路径。 |
+| `draft_tensor_parallel_size` | integer | 草稿模型使用的张量并行（tensor parallelism）数量。 |
+| `enforce_eager` | boolean | 是否强制使用 eager 模式而非编译模式。 |
+| `num_speculative_tokens` | integer | 草稿模型每次推测生成的 token 数量。 |
 
 
 

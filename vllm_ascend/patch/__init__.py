@@ -455,6 +455,7 @@
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.sampling_params.SamplingParams._validate_structured_outputs`
 #      `vllm.v1.structured_output.StructuredOutputManager.grammar_init`
+#      `vllm.v1.structured_output.StructuredOutputManager.grammar_bitmask`
 #    Why:
 #       V1 structured outputs use one engine-level backend, while `backend=auto`
 #       resolves the backend per request. After one request initializes
@@ -464,7 +465,9 @@
 #       Record the first resolved backend on the structured-output config and
 #       reject later requests that resolve to a different backend. Also guard
 #       `grammar_init` so requests that bypass API-side validation fail before
-#       backend grammar compilation.
+#       backend grammar compilation. For auto tool calls with standalone tool
+#       boundary tokens, replace masks outside the tool-call region with a
+#       full mask so the NPU runner can skip the CPU logits round trip.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/issues/43920
 #       https://github.com/vllm-project/vllm/pull/44401

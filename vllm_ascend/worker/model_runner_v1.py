@@ -148,6 +148,7 @@ from vllm_ascend.spec_decode.utils import (
     correct_optimistic_seq_lens_cpu,
     update_num_computed_tokens_for_batch_change,
 )
+from vllm_ascend.structured_output import has_grammar_bitmask_constraints
 from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
@@ -2130,6 +2131,31 @@ class NPUModelRunner(GPUModelRunner):
         return None
 
     @torch.inference_mode()
+    def _apply_grammar_bitmask(
+        self,
+        scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None",
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if grammar_output is None or not has_grammar_bitmask_constraints(
+            grammar_output.grammar_bitmask
+        ):
+            return logits
+
+        # Unlike the GPU runner, Ascend cannot use the torch.compile optimized
+        # xgrammar kernel here. Keep the existing CPU fallback, but invoke it
+        # only for steps that contain an effective grammar constraint.
+        logits_dtype = logits.dtype
+        logits = logits.to("cpu").float()
+        apply_grammar_bitmask(
+            scheduler_output,
+            grammar_output,
+            self.input_batch,
+            logits,
+        )
+        return logits.to(self.device).to(logits_dtype)
+
+    @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -2169,14 +2195,11 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            # here we are different from gpu_model_runner,
-            # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
-            logits_dtype = logits.dtype
-            logits = logits.to("cpu").float()
-            apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
-            logits = logits.to(self.device).to(logits_dtype)
+        logits = self._apply_grammar_bitmask(
+            scheduler_output,
+            grammar_output,
+            logits,
+        )
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)

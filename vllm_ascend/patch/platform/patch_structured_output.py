@@ -11,7 +11,10 @@ from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_ascend.structured_output import mask_tool_call_free_text
+
 _BACKEND_ATTR = "_vllm_ascend_structured_output_backend"
+_ORIGINAL_GRAMMAR_BITMASK_ATTR = "_vllm_ascend_original_grammar_bitmask"
 _ORIGINAL_GRAMMAR_INIT_ATTR = "_vllm_ascend_original_grammar_init"
 _ORIGINAL_VALIDATE_ATTR = "_vllm_ascend_original_validate_structured_outputs"
 
@@ -106,7 +109,13 @@ def _patch_sampling_params_validation() -> None:
 
 def _patch_structured_output_manager() -> None:
     original_grammar_init = StructuredOutputManager.grammar_init
+    original_grammar_bitmask = StructuredOutputManager.grammar_bitmask
     setattr(StructuredOutputManager, _ORIGINAL_GRAMMAR_INIT_ATTR, original_grammar_init)
+    setattr(
+        StructuredOutputManager,
+        _ORIGINAL_GRAMMAR_BITMASK_ATTR,
+        original_grammar_bitmask,
+    )
 
     def grammar_init(self: StructuredOutputManager, request: Any) -> None:
         request_backend = _request_backend(request)
@@ -127,7 +136,30 @@ def _patch_structured_output_manager() -> None:
             setattr(self, _BACKEND_ATTR, request_backend)
         return result
 
+    def grammar_bitmask(
+        self: StructuredOutputManager,
+        requests: dict[str, Any],
+        structured_output_request_ids: list[str],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ):
+        bitmask = original_grammar_bitmask(
+            self,
+            requests,
+            structured_output_request_ids,
+            scheduled_spec_decode_tokens,
+        )
+        if bitmask is None:
+            return None
+        return mask_tool_call_free_text(
+            self,
+            requests,
+            structured_output_request_ids,
+            scheduled_spec_decode_tokens,
+            bitmask,
+        )
+
     StructuredOutputManager.grammar_init = grammar_init
+    StructuredOutputManager.grammar_bitmask = grammar_bitmask
 
 
 _patch_sampling_params_validation()

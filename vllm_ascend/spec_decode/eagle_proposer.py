@@ -173,6 +173,18 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
 
+    def _apply_global_output_token_mask(self, logits: torch.Tensor) -> torch.Tensor:
+        mask = self.runner._global_output_token_mask
+        if mask is None:
+            return logits
+        if logits.shape[-1] != mask.shape[0]:
+            raise RuntimeError(
+                "Global output-token mask shape does not match draft logits: "
+                f"mask={tuple(mask.shape)}, logits={tuple(logits.shape)}"
+            )
+        logits.masked_fill_(mask, float("-inf"))
+        return logits
+
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
@@ -808,6 +820,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         logits = self.model.compute_logits(sample_hidden_states)
+        logits = self._apply_global_output_token_mask(logits)
 
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
@@ -933,6 +946,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
             logits = self.model.compute_logits(sample_hidden_states)
+            logits = self._apply_global_output_token_mask(logits)
 
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]

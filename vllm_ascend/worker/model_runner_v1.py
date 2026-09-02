@@ -17,7 +17,9 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import json
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -405,6 +407,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        self._global_output_token_mask = self._load_global_output_token_mask()
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -433,6 +436,45 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+
+    def _load_global_output_token_mask(self) -> torch.Tensor | None:
+        path = os.getenv("VLLM_ASCEND_GLOBAL_ALLOWED_TOKEN_IDS_PATH", "").strip()
+        if not path:
+            return None
+
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        allowed_token_ids = (
+            data.get("allowed_token_ids") if isinstance(data, dict) else data
+        )
+        if not isinstance(allowed_token_ids, list) or not allowed_token_ids:
+            raise ValueError(
+                "Global allowed-token file must contain a non-empty list or "
+                "an object with a non-empty 'allowed_token_ids' list."
+            )
+        if any(type(token_id) is not int for token_id in allowed_token_ids):
+            raise TypeError("Global allowed token IDs must all be integers.")
+
+        allowed_token_ids = sorted(set(allowed_token_ids))
+        vocab_size = self.model_config.get_vocab_size()
+        if allowed_token_ids[0] < 0 or allowed_token_ids[-1] >= vocab_size:
+            raise ValueError(
+                "Global allowed token IDs must satisfy "
+                f"0 <= token_id < {vocab_size}."
+            )
+
+        mask = torch.ones(vocab_size, dtype=torch.bool, device="cpu")
+        mask[allowed_token_ids] = False
+        mask = mask.to(self.device)
+        logger.info(
+            "Enabled global NPU output-token mask from %s: allowed=%d, "
+            "blocked=%d, vocab_size=%d",
+            path,
+            len(allowed_token_ids),
+            vocab_size - len(allowed_token_ids),
+            vocab_size,
+        )
+        return mask
 
     @property
     def use_cp(self) -> bool:
@@ -1487,6 +1529,18 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+
+        if self._global_output_token_mask is not None:
+            if (
+                logits is None
+                or logits.shape[-1] != self._global_output_token_mask.shape[0]
+            ):
+                raise RuntimeError(
+                    "Global output-token mask shape does not match logits: "
+                    f"mask={tuple(self._global_output_token_mask.shape)}, "
+                    f"logits={None if logits is None else tuple(logits.shape)}"
+                )
+            logits.masked_fill_(self._global_output_token_mask, float("-inf"))
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)

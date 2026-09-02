@@ -17,7 +17,9 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import json
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -73,8 +75,9 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import RejectionSampler, rejection_sample
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
@@ -107,6 +110,11 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.output_vocab import (
+    COMPACT_OUTPUT_HEAD_CONFIG_ENV,
+    apply_compact_output_head,
+    apply_compact_output_processor_to_drafter,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -405,6 +413,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        self._global_output_token_mask = self._load_global_output_token_mask()
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -433,6 +442,45 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+
+    def _load_global_output_token_mask(self) -> torch.Tensor | None:
+        path = os.getenv("VLLM_ASCEND_GLOBAL_ALLOWED_TOKEN_IDS_PATH", "").strip()
+        if not path:
+            return None
+
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        allowed_token_ids = (
+            data.get("allowed_token_ids") if isinstance(data, dict) else data
+        )
+        if not isinstance(allowed_token_ids, list) or not allowed_token_ids:
+            raise ValueError(
+                "Global allowed-token file must contain a non-empty list or "
+                "an object with a non-empty 'allowed_token_ids' list."
+            )
+        if any(type(token_id) is not int for token_id in allowed_token_ids):
+            raise TypeError("Global allowed token IDs must all be integers.")
+
+        allowed_token_ids = sorted(set(allowed_token_ids))
+        vocab_size = self.model_config.get_vocab_size()
+        if allowed_token_ids[0] < 0 or allowed_token_ids[-1] >= vocab_size:
+            raise ValueError(
+                "Global allowed token IDs must satisfy "
+                f"0 <= token_id < {vocab_size}."
+            )
+
+        mask = torch.ones(vocab_size, dtype=torch.bool, device="cpu")
+        mask[allowed_token_ids] = False
+        mask = mask.to(self.device)
+        logger.info(
+            "Enabled global NPU output-token mask from %s: allowed=%d, "
+            "blocked=%d, vocab_size=%d",
+            path,
+            len(allowed_token_ids),
+            vocab_size - len(allowed_token_ids),
+            vocab_size,
+        )
+        return mask
 
     @property
     def use_cp(self) -> bool:
@@ -1488,6 +1536,18 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        if self._global_output_token_mask is not None:
+            if (
+                logits is None
+                or logits.shape[-1] != self._global_output_token_mask.shape[0]
+            ):
+                raise RuntimeError(
+                    "Global output-token mask shape does not match logits: "
+                    f"mask={tuple(self._global_output_token_mask.shape)}, "
+                    f"logits={None if logits is None else tuple(logits.shape)}"
+                )
+            logits.masked_fill_(self._global_output_token_mask, float("-inf"))
+
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -1608,10 +1668,80 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
         )
 
+    def _compact_fast_greedy_supported(self, sampling_metadata: SamplingMetadata) -> bool:
+        if not sampling_metadata.all_greedy:
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if not sampling_metadata.no_penalties:
+            return False
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return False
+        if sampling_metadata.bad_words_token_ids:
+            return False
+        # Argmax-invariant processors do not change greedy token selection.
+        # Spec decode always installs MinTokensLogitsProcessor; it is also a
+        # no-op when no request currently has an active min_tokens constraint.
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            if isinstance(processor, MinTokensLogitsProcessor) and not processor.min_toks:
+                continue
+            return False
+        return True
+
+    def _sample_compact_greedy(self, logits, spec_decode_metadata):
+        state = self.compact_output_vocab
+        mapping = state.compact_to_original_ids
+        if spec_decode_metadata is None:
+            if lmhead_tp_enable() and logits is not None:
+                logits = logits[: self.input_batch.num_reqs]
+            sampled = mapping[logits.argmax(dim=-1).to(torch.int64)]
+            return SamplerOutput(
+                sampled_token_ids=sampled.to(torch.int32).unsqueeze(-1),
+                logprobs_tensors=None,
+            )
+
+        if lmhead_tp_enable() and logits is not None:
+            logits = logits[: len(spec_decode_metadata.logits_indices)]
+        compact_draft_token_ids = state.original_to_compact_ids[
+            spec_decode_metadata.draft_token_ids.to(torch.int64)
+        ].to(torch.int32)
+        compact_bonus_token_ids = logits[
+            spec_decode_metadata.bonus_logits_indices
+        ].argmax(dim=-1).to(torch.int32)
+        compact_target_logits = logits[spec_decode_metadata.target_logits_indices]
+        compact_output_token_ids = rejection_sample(
+            compact_draft_token_ids,
+            spec_decode_metadata.num_draft_tokens,
+            spec_decode_metadata.max_spec_len,
+            spec_decode_metadata.cu_num_draft_tokens,
+            None,  # draft_probs
+            compact_target_logits,
+            compact_bonus_token_ids,
+            self.input_batch.sampling_metadata,
+        )
+        safe_ids = compact_output_token_ids.clamp_min(0).to(torch.int64)
+        mapped_ids = mapping[safe_ids].to(torch.int32)
+        output_token_ids = torch.where(
+            compact_output_token_ids >= 0,
+            mapped_ids,
+            compact_output_token_ids,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
+        )
+
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        compact_state = getattr(self, "compact_output_vocab", None)
+        if compact_state is not None and compact_state.logits_processor.return_compact_logits:
+            if self._compact_fast_greedy_supported(sampling_metadata):
+                return self._sample_compact_greedy(logits, spec_decode_metadata)
+            if logits is not None:
+                logits = compact_state.logits_processor.expand_logits(logits)
+
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
@@ -2568,6 +2698,17 @@ class NPUModelRunner(GPUModelRunner):
             if self.eplb_enable:
                 self.vllm_config.parallel_config.enable_eplb = True
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            if (
+                os.getenv(COMPACT_OUTPUT_HEAD_CONFIG_ENV, "").strip()
+                and self._global_output_token_mask is not None
+            ):
+                raise ValueError(
+                    "Compact output LM Head and global output-token mask "
+                    "cannot be enabled together."
+                )
+            self.compact_output_vocab = apply_compact_output_head(
+                self.model, self.device
+            )
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:
@@ -2576,6 +2717,10 @@ class NPUModelRunner(GPUModelRunner):
                     patch_load_weights(self.vllm_config)
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
+                apply_compact_output_processor_to_drafter(
+                    self.drafter,
+                    self.compact_output_vocab,
+                )
                 if self.use_aux_hidden_state_outputs:
                     from vllm.model_executor.models.interfaces import supports_eagle3
                     if not supports_eagle3(self.model):

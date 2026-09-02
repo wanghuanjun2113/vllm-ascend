@@ -173,6 +173,24 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
 
+    def _apply_global_output_token_mask(self, logits: torch.Tensor) -> torch.Tensor:
+        mask = self.runner._global_output_token_mask
+        if mask is None:
+            return logits
+        if logits.shape[-1] != mask.shape[0]:
+            raise RuntimeError(
+                "Global output-token mask shape does not match draft logits: "
+                f"mask={tuple(mask.shape)}, logits={tuple(logits.shape)}"
+            )
+        logits.masked_fill_(mask, float("-inf"))
+        return logits
+
+    def _map_compact_output_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
+        state = getattr(self.runner, "compact_output_vocab", None)
+        if state is None or not state.logits_processor.return_compact_logits:
+            return token_ids
+        return state.compact_to_original_ids[token_ids.to(torch.int64)].to(token_ids.dtype)
+
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
@@ -808,12 +826,13 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         logits = self.model.compute_logits(sample_hidden_states)
+        logits = self._apply_global_output_token_mask(logits)
 
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids = self._map_compact_output_token_ids(logits.argmax(dim=-1))
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -821,7 +840,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._map_compact_output_token_ids(logits.argmax(dim=-1))
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -933,6 +952,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
             logits = self.model.compute_logits(sample_hidden_states)
+            logits = self._apply_global_output_token_mask(logits)
 
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
@@ -940,7 +960,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._map_compact_output_token_ids(logits.argmax(dim=-1))
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]

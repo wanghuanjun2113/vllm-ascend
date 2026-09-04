@@ -257,7 +257,9 @@ elif token_id not in special_ids and text and text.isascii():
 5. 保存排序去重后的 `allowed_token_ids`，并记录模型路径、Tokenizer 文件 SHA、规则版本、EOS、协议 Token、allowed count、blocked count 和 Allow-list SHA-256。
 6. 服务启动时重新核对模型词表长度、Token ID 范围和文件指纹；任一校验失败都应终止启动。
 
-Qwen3.6 的模型词表为 248,320，Tokenizer 长度为 248,077，本次 Allow-list 有 127,803 个 Token。DS V4 Flash 的模型词表和 Tokenizer 长度均为 129,280，按相同 ASCII 规则分析得到 72,699 个允许 Token。两个模型必须分别生成文件，不能共用 Allow-list。
+完整生成器见 `tools/build_global_allowed_token_ids.py`。穿刺实验使用 `text.isascii()`，Qwen3.6 与 DS V4 Flash 分别得到 127,803 和 72,699 个允许 Token；严格生产规则进一步排除除 `TAB/LF/CR` 外的 ASCII 控制字符，分别得到 127,771 和 72,669 个允许 Token。两种规则的差异仅为 32 和 30 个控制字符 Token，不涉及可打印英文 Token。
+
+Qwen3.6 的模型词表为 248,320，Tokenizer 长度为 248,077；DS V4 Flash 的模型词表和 Tokenizer 长度均为 129,280。两个模型必须分别生成文件，不能共用 Allow-list。
 
 #### 4.1.4 是否能够 100% 保证无中文字符
 
@@ -419,6 +421,7 @@ Main Head compute_logits -> [Global Target Mask] -> Target sample/verify
 |---|---|
 | `vllm_ascend/worker/model_runner_v1.py` | 读取环境变量、校验 Allow-list、创建 NPU Bool Mask、约束 Target logits |
 | `vllm_ascend/spec_decode/eagle_proposer.py` | 复用 runner Mask，约束首次和后续 MTP Draft logits |
+| `tools/build_global_allowed_token_ids.py` | 按模型 Tokenizer 生成严格 ASCII Allow-list、统计信息和可校验指纹 |
 | `docs/design/qwen36_english_only_global_mask.md` | 方案开关、优势、限制与早期验证说明 |
 | `docs/design/qwen36_global_target_mtp_npu_mask_design.md` | 本设计说明书 |
 | `docs/design/qwen36_global_mask_raw_results_20260904.md` | 本次 TP4 原始回答、逐轮指标与 SHA 校验 |

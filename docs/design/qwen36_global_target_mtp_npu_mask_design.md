@@ -1,8 +1,8 @@
-# 全局 Target + MTP Draft NPU Mask 设计说明书
+# 全局 Target 与 MTP Draft NPU Mask 设计说明书
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | V1.0 |
+| 文档版本 | V1.1 |
 | 日期 | 2026-09-04 |
 | 决策方案 | 全局 Target + MTP Draft NPU Mask |
 | Qwen3.6 状态 | 已实现、已完成 TP4 穿刺 |
@@ -73,34 +73,19 @@ export VLLM_ASCEND_GLOBAL_ALLOWED_TOKEN_IDS_PATH=/path/allowed_ascii_token_ids.j
 
 ### 2.3 端到端时序
 
-```text
-服务启动
-  -> 读取 Allow-list JSON
-  -> 校验 Token ID
-  -> CPU Bool Mask: 全 True
-  -> allowed_token_ids 位置写 False
-  -> H2D 到每个 NPU rank
+![Target 与三步 MTP Draft 的可视化时序](assets/qwen36_global_mask/03-runtime-loop.png)
 
-每轮解码
-  -> Target Forward / LM Head
-  -> Target logits 全局 Mask
-  -> Target Sample + Draft Verify
-  -> MTP Step 1 logits 全局 Mask -> Argmax
-  -> MTP Step 2 logits 全局 Mask -> Argmax
-  -> MTP Step 3 logits 全局 Mask -> Argmax
-  -> Accept / Reject
-  -> 返回允许 Token
-```
+时序分为启动阶段和解码迭代。启动时，服务进程读取 Allow-list、校验 Token ID、创建 Bool Mask，并把它复制到每个 NPU rank。解码时，Target logits 先经过 Global Mask，再进入采样与校验；随后最多执行三个 MTP Draft step，每一步都在 Argmax 前应用同一张 Mask。MTP3 一轮最多返回三个 Draft Token 加一个 Target Bonus Token，因此单轮最多输出四个 Token。
 
-![Target 与三步 MTP Draft 的 Mask 时序](assets/qwen36_global_mask/03-runtime-loop.png)
-
-Target 必须被约束，因为最终输出由 Target 采样/校验决定；Draft 同样被约束，是为了避免 Draft 提出 Target 永远不会接受的 Token，并保持两者候选空间一致。
+Target 必须被约束，因为最终输出由 Target 采样和校验决定。Draft 使用同一张 Mask，可避免提出 Target 必然拒绝的禁止 Token，并使两侧候选空间一致。
 
 ## 3. 穿刺结果
 
 ### 3.1 测试环境与证据管理
 
-![Base 与 Mask 的 TP4 AB/BA 验证方法](assets/qwen36_global_mask/05-validation-method.png)
+![效果验证 精度验证和性能验证三条证据链](assets/qwen36_global_mask/05-validation-method.png)
+
+验证分成三条相互独立的证据链。效果验证检查最终回答是否仍含中文以及是否出现重复或任务降级；精度验证比较 ARC Challenge 和 HellaSwag 的正确率与逐题预测；性能验证使用自然英文长上下文，比较 TTFT、TPOT、吞吐、E2E、MTP 接收率和 Prefix Cache 命中。三类结果都先保存为原始 JSON，再汇总到 `RESULT_SUMMARY.json` 和 `RAW_RESULTS.md`。
 
 **实测环境：**
 
@@ -127,7 +112,7 @@ Target 必须被约束，因为最终输出由 Target 采样/校验决定；Draf
 | Chinese-only science | 含中文 | 纯 ASCII |
 | 合计 | 4/4 含 CJK | 0/4 含 CJK，4/4 纯 ASCII |
 
-#### 用例一：英译中
+#### 用例一 英译中
 
 **Prompt**
 
@@ -141,7 +126,7 @@ Target 必须被约束，因为最终输出由 Target 采样/校验决定；Draf
 
 > Your account will remain active, but saved payment methods must be verified again after the security update.
 
-#### 用例二：双语排障
+#### 用例二 双语排障
 
 **Prompt**
 
@@ -161,7 +146,7 @@ Target 必须被约束，因为最终输出由 Target 采样/校验决定；Draf
 
 这个用例同时暴露方案边界：硬约束能保证不输出中文，但在用户强制要求双语时可能产生重复或任务降级。英文业务应在入口侧拒绝明确的中文输出要求，不能把 NPU Mask 当成语言改写器。四个用例的完整 Prompt 和回答见原始记录。
 
-### 3.3 性能对比：8K + 1K、并发 8、每轮 80 请求
+### 3.3 性能对比
 
 #### 3.3.1 数据选择
 
@@ -199,6 +184,22 @@ normalized_delta = sqrt((Mask4-7 / Base0-3) × (Mask0-3 / Base4-7)) - 1
 归一化后，输出吞吐约 -1.536%，mean TPOT 约 +1.961%，mean E2E 约 +1.219%，投机接收率约 +0.256%。因此本负载下方案存在约 1.5%–2.0% 的性能成本，不能写成“性能完全无损”或“控制在 1% 内”。
 
 接收率基本一致，说明性能差异不是由 MTP 接受率退化导致。主要新增工作是低接收率场景下 Target 与每个 MTP step 都对全词表执行 Mask；如后续必须达到 1% 门槛，应单独评估 Mask+Argmax 融合或采样器融合，禁止回退到已知高风险的 compact-to-full scatter 热路径。
+
+#### 3.3.4 TPOT 控制在 1% 以内的优化路径
+
+当前 Base mean TPOT 为 22.455 ms，1% 上限是 22.680 ms；Mask mean TPOT 为 22.838 ms。要达到门槛，需要把 TPOT 至少降低 0.158 ms，相当于收回当前 0.382 ms 增量的约 41%。该目标需要从 Draft 热路径和 Target 采样路径分别优化，不能靠延迟 TTFT 或改变输出长度获得表面改善。
+
+| 优先级 | 优化点 | 实现方法 | 预期作用 | 风险和验证 |
+|---|---|---|---|---|
+| P0 | 先裁有效行再 Mask | 当前 Draft 路径是 `compute_logits -> Mask -> lmhead_tp 行裁剪`。调整为先裁到 `num_indices`，再对有效 logits 执行 Mask | 避免处理 padding request 对应的整行词表 | 语义不变；需覆盖 padded batch、DP 和 LM Head TP |
+| P0 | 分离 Target 与 Draft 开销 | 在 Target Mask、首次 Draft Mask、后续三个 Draft Mask 周围增加独立 profiling 标记 | 明确 0.382 ms 增量的真实占比，避免盲目优化 | 使用接收率约 62% 的同一自然数据复测 |
+| P1 | 融合 Draft Mask 与 Argmax | 为 Greedy Draft 实现 `masked_argmax`，在一次 NPU 图或融合算子中完成屏蔽和候选选择 | 减少每个 MTP step 的全词表写回和 Kernel Launch | 必须保持原 Token ID；随机采样不能复用该捷径 |
+| P1 | 融合 Target Mask 与 Rejection Sampler | 将全局 Mask 作为 Sampler 或 Rejection Sampler 的常驻输入，与概率处理和候选校验同图执行 | 减少 Target 热路径的独立 `masked_fill_` | 需覆盖 top-k、top-p、logprobs、penalty 和 structured output |
+| P2 | 固定形状图捕获 | 对常见 batch size 捕获包含 Mask 的完整 Decode Graph，Mask 地址保持稳定 | 减少 Host Launch 和同步开销 | 必须确认动态图和 Prefix Cache 场景没有回退 |
+
+不采用三类看似简单但不满足目标的方案：LM Head 禁止行置零不能保证零 logits 不被选中；compact logits 再 scatter 回完整词表会增加热路径写回；只约束 Target 会让 Draft 持续提出无效 Token。
+
+优化后的验收仍使用本次 8K+1K、并发 8、80 请求的自然英文数据，保持 MTP 接收率在正常区间，并执行至少五轮 ABBA 卡组互换。通过条件是 mean TPOT、输出吞吐和 mean E2E 相对 Base 的劣化均不超过 1%，同时中文穿刺、两个英文精度集和异常路径测试不回退。
 
 ### 3.4 英文精度对比
 
@@ -244,6 +245,38 @@ elif token_id not in special_ids and text and text.isascii():
 7. 启动时核对 Allow-list 元数据与模型配置，防止错模型加载。
 
 需要注意：Token 文本包含中文字符只是构造屏蔽集的一种方法；最终安全性质来自“所有允许 Token 的独立解码结果都满足输出字符策略”，而不是依赖 Token 名称或 Unicode 区段猜测。
+
+#### 4.1.3 Mask 文件生成步骤
+
+生产生成器应输出 Allow-list 和 Manifest 两个文件。完整步骤如下：
+
+1. 加载目标模型自己的 Tokenizer 和 `config.json`，读取 `tokenizer_size`、`model_vocab_size`、EOS 与 special token IDs。
+2. 枚举 `[0, tokenizer_size)`，对每个 Token 单独解码，并关闭 `skip_special_tokens` 和文本清理。
+3. 普通 Token 只有在解码结果非空且全部属于允许字符集时才能进入 Allow-list。本次严格英文策略允许 `TAB`、`LF`、`CR` 和 `0x20-0x7E`；EOS 单独加入；其他协议 Token 必须由业务显式声明。
+4. 创建长度为 `model_vocab_size` 的 Bool Mask，初始值全部为 `True`，再把 Allow-list 对应位置写为 `False`。模型词表大于 Tokenizer 的尾部 padding IDs 因而保持屏蔽。
+5. 保存排序去重后的 `allowed_token_ids`，并记录模型路径、Tokenizer 文件 SHA、规则版本、EOS、协议 Token、allowed count、blocked count 和 Allow-list SHA-256。
+6. 服务启动时重新核对模型词表长度、Token ID 范围和文件指纹；任一校验失败都应终止启动。
+
+Qwen3.6 的模型词表为 248,320，Tokenizer 长度为 248,077，本次 Allow-list 有 127,803 个 Token。DS V4 Flash 的模型词表和 Tokenizer 长度均为 129,280，按相同 ASCII 规则分析得到 72,699 个允许 Token。两个模型必须分别生成文件，不能共用 Allow-list。
+
+#### 4.1.4 是否能够 100% 保证无中文字符
+
+Qwen3.6 和当前两份 DS V4 Flash Tokenizer 都使用 ByteLevel Decoder。若每个允许 Token 的独立解码结果都是 ASCII，那么允许 Token 对应的字节不能包含完整或残缺的非 ASCII UTF-8 序列；多个允许 Token 拼接后仍只能得到 ASCII。因此，在 Tokenizer 未变化、所有生成路径都应用同一张 Mask、没有组件在解码后插入内容的条件下，模型 Token 解码结果不会包含字面中文字符。
+
+单 Token 过滤本身不能给出整个应用链路的 100% 保证。生产系统必须在流式分片合并、JSON 反转义、工具调用和模板后处理完成后执行最终 Unicode Gate。若目标是严格 ASCII，可直接检查 `final_text.isascii()`；若只禁止中文而允许重音字符和其他文字，应检查完整 CJK Unicode 区段。发现违规时必须拒绝、重试或返回固定英文降级内容，不能删除字符后继续返回。
+
+| 风险 | 表现 | 控制措施 |
+|---|---|---|
+| Allow-list 与模型不匹配 | 词表长度错误，或错误 Token 被放行 | Manifest 绑定模型和 Tokenizer SHA，启动时 fail closed |
+| 新生成路径未接入 Mask | 新 Draft、Beam Search 或自定义算子绕过约束 | 建立所有 `compute_logits -> candidate select` 路径清单和强制测试 |
+| 协议 Token 配置错误 | 无法结束、工具协议或结构化输出失败 | 仅显式加入必要协议 Token，并为每种协议单测 |
+| Structured Output 空交集 | Grammar 允许集被全局 Mask 全部屏蔽 | 采样前检测空交集并返回明确错误 |
+| 流式和反转义 | ASCII `\u4e2d` 被下游再次反转义为中文 | Unicode Gate 放在所有反转义和分片合并之后 |
+| 后处理插入中文 | 工具、模板或业务代码绕过 Token 约束 | Gate 检查最终返回字符串，而不是只检查模型增量 |
+| 严格 ASCII 过度约束 | 重音字符、弯引号、数学符号和 Emoji 被屏蔽 | 明确产品字符策略，必要时使用“禁止 CJK”而非“仅 ASCII”规则 |
+| 语义绕过 | 输出拼音或 Unicode 转义，字符不是中文但仍表达中文 | 字符 Mask 只能保证字符集合；语义限制需要独立分类策略 |
+
+因此，准确结论是：NPU Mask 在满足路径覆盖和版本一致性时，可以保证模型 Token 解码不产生中文字符；`NPU Mask + 最终 Unicode Gate + fail closed` 才能对最终应用响应给出 100% 的字面字符保证。它不能保证输出不表达中文语义。
 
 ### 4.2 启动加载与生命周期
 
@@ -328,8 +361,6 @@ Qwen 路径无需改模型实现文件：Target 由通用 `model_runner_v1.py` �
 
 ### 4.6 DeepSeek V4 Flash 处理方案
 
-![Qwen3.6 与 DeepSeek V4 Flash 适配边界](assets/qwen36_global_mask/04-model-adaptation.png)
-
 #### 4.6.1 已核对事实
 
 当前机器存在两份 DS V4 Flash 权重，但本次没有启动它们：
@@ -391,7 +422,7 @@ Main Head compute_logits -> [Global Target Mask] -> Target sample/verify
 | `docs/design/qwen36_english_only_global_mask.md` | 方案开关、优势、限制与早期验证说明 |
 | `docs/design/qwen36_global_target_mtp_npu_mask_design.md` | 本设计说明书 |
 | `docs/design/qwen36_global_mask_raw_results_20260904.md` | 本次 TP4 原始回答、逐轮指标与 SHA 校验 |
-| `docs/design/assets/qwen36_global_mask/*.png` | 五张 Technical Whitepaper Infographic 配图 |
+| `docs/design/assets/qwen36_global_mask/*.png` | 四张 Technical Whitepaper Infographic 配图，其中时序图和验证图为确定性绘制 |
 
 实现代码分支：[exp/qwen36-english-only-global-mask](https://github.com/wanghuanjun2113/vllm-ascend/tree/exp/qwen36-english-only-global-mask)。本说明书和原始记录位于独立文档分支 `docs/qwen36-global-mask-design`。
 

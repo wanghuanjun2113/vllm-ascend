@@ -101,6 +101,7 @@ class SnapshotPool:
         self.completed += 1
         self.free.put(slot)
 
+    @torch.inference_mode()
     def _copy_loop(self):
         try:
             torch.npu.set_device(self.device)

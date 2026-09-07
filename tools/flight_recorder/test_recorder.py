@@ -237,26 +237,27 @@ def test_pooled_snapshot_survives_source_reuse_and_backpressure(k,tmp_path,monke
     spec=SimpleNamespace(num_draft_tokens=[3,1],
         draft_token_ids=torch.tensor([1,100,101,3],device="npu"))
     selected=torch.tensor([[1,2,-1,-1],[3,4,-1,-1]],device="npu")
-    pool=poolmod.SnapshotPool(runner,source)
-    for rid in ("a","b"):
-        writer.submit({"kind":"request","request_id":rid,"prompt_token_ids":[],
-                       "sampling_params":{},"sampling_params_complete":True})
-    for step in range(12):
-        runner.input_batch.req_ids=["a","b"]
-        source.copy_(base+step*20)
-        frame=pool.capture(runner,source,spec)
-        final=source.clone();final[:,2047]=-float("inf")
-        frame.rows=torch.tensor([3,5],device="npu")
-        frame.processed(final[[3,5]],runner.input_batch.sampling_metadata)
-        frame.rows=torch.tensor([0,1,2,4],device="npu")
-        frame.processed(final[[0,1,2,4]])
-        frame.finish(SimpleNamespace(sampled_token_ids=selected))
-        source.fill_(-999)  # Reused immediately, before the consumer finishes.
-        runner.input_batch.req_ids=["wrong","request"]
-    for rid,ids in (("a",[1,2]*12),("b",[3,4]*12)):
-        writer.submit({"kind":"output","request_id":rid,"token_ids":ids,
-                       "finish_reason":"stop","stop_reason":2047})
-    pool.close()
+    with torch.inference_mode():
+        pool=poolmod.SnapshotPool(runner,source)
+        for rid in ("a","b"):
+            writer.submit({"kind":"request","request_id":rid,"prompt_token_ids":[],
+                           "sampling_params":{},"sampling_params_complete":True})
+        for step in range(12):
+            runner.input_batch.req_ids=["a","b"]
+            source.copy_(base+step*20)
+            frame=pool.capture(runner,source,spec)
+            final=source.clone();final[:,2047]=-float("inf")
+            frame.rows=torch.tensor([3,5],device="npu")
+            frame.processed(final[[3,5]],runner.input_batch.sampling_metadata)
+            frame.rows=torch.tensor([0,1,2,4],device="npu")
+            frame.processed(final[[0,1,2,4]])
+            frame.finish(SimpleNamespace(sampled_token_ids=selected))
+            source.fill_(-999)  # Reused immediately, before the consumer finishes.
+            runner.input_batch.req_ids=["wrong","request"]
+        for rid,ids in (("a",[1,2]*12),("b",[3,4]*12)):
+            writer.submit({"kind":"output","request_id":rid,"token_ids":ids,
+                           "finish_reason":"stop","stop_reason":2047})
+        pool.close()
     assert not Path(pool.path).exists()
     store=TraceStore(tmp_path)
     assert store.audit()["complete"]

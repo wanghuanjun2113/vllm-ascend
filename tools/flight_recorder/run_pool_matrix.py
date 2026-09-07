@@ -19,16 +19,16 @@ def snapshot(name):
             "diff_sha256":hashlib.sha256(subprocess.check_output(["git","-C",str(root),"diff","HEAD"])).hexdigest()}
     path.write_text(json.dumps(meta,indent=2))
 try:
-    for name,k in (("pool128",128),("pool1024",1024)):
-        if name=="pool1024":
+    for name,k in (("pooled128",128),("pooled1024",1024)):
+        if name=="pooled1024":
             state("starting",name=name);manage.stop();manage.start(name,k)
         state("waiting_ready",name=name);wait_ready();snapshot(name)
         state("benchmark",name=name);bench(name);audit(name)
-    name="pool-random1024";(ART/name).mkdir()
+    name="pooled-random1024";(ART/name).mkdir()
     state("random");bench(name,n=2,concurrency=(1,4),temperature=0.7,warmup=0)
-    audit("pool1024")
+    audit("pooled1024")
     manage.stop()
-    audit("pool128");audit("pool1024")
+    audit("pooled128");audit("pooled1024")
     state("done")
 except Exception as exc:
     state("failed",error=repr(exc))

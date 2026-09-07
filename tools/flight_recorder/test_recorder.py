@@ -272,3 +272,48 @@ def test_pooled_snapshot_survives_source_reuse_and_backpressure(k,tmp_path,monke
     info=json.loads(next(tmp_path.glob("pool-*.json")).read_text())
     assert info["completed"]==info["submitted"]==12
     assert info["max_pending"]<=2
+
+
+def test_stop_waits_for_owned_children_and_preserves_other_processes(tmp_path,monkeypatch):
+    import subprocess,time
+    import manage
+    monkeypatch.setattr(manage,"ART",tmp_path)
+    child_code="import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(60)"
+    parent_code=("import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',"+
+                 repr(child_code)+"],stdout=subprocess.PIPE,text=True);p.stdout.readline();"
+                 "print(p.pid,flush=True);time.sleep(60)")
+    own=subprocess.Popen([sys.executable,"-c",parent_code,
+                          "vllm.entrypoints.openai.api_server","18327"],
+                         stdout=subprocess.PIPE,text=True,start_new_session=True)
+    other=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],start_new_session=True)
+    child=int(own.stdout.readline())
+    snapshot=Path("/dev/shm")/f"vllm-logits-{child}-test-cleanup"
+    snapshot.write_bytes(b"temporary task snapshot")
+    (tmp_path/"server.pid").write_text(str(own.pid))
+    original_sleep=time.sleep
+    monkeypatch.setattr(manage.time,"sleep",lambda seconds:original_sleep(min(seconds,0.001)))
+    try:
+        manage.stop()
+        own.wait(timeout=3)
+        assert not manage.group_members(own.pid)
+        assert other.poll() is None
+        assert not snapshot.exists()
+    finally:
+        if own.poll() is None:os.killpg(own.pid,9)
+        if other.poll() is None:other.terminate()
+        other.wait(timeout=3)
+        snapshot.unlink(missing_ok=True)
+
+
+def test_stop_rejects_unrelated_pid(tmp_path,monkeypatch):
+    import subprocess
+    import manage
+    monkeypatch.setattr(manage,"ART",tmp_path)
+    proc=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],start_new_session=True)
+    (tmp_path/"server.pid").write_text(str(proc.pid))
+    try:
+        with pytest.raises(RuntimeError,match="not the task-owned"):
+            manage.stop()
+        assert proc.poll() is None
+    finally:
+        proc.terminate();proc.wait(timeout=3)

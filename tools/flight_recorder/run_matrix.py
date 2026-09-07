@@ -20,6 +20,10 @@ def status(stage, **extra):
 def wait_ready():
     deadline=time.monotonic()+900
     while time.monotonic()<deadline:
+        pid=int((ART/"server.pid").read_text())
+        command=Path(f"/proc/{pid}/cmdline")
+        if not command.exists() or not command.read_bytes():
+            raise RuntimeError("task API process exited during startup")
         try:
             if urllib.request.urlopen("http://127.0.0.1:18327/health",timeout=2).status==200:
                 return

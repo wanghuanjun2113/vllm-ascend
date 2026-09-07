@@ -9,6 +9,8 @@
 feat/logits-flight-recorder 分支。不能只安装 Ascend 修改而漏掉 vLLM 的采样和输出事件钩子。
 
 设置 PYTHONPATH 时要保留 CANN 原有路径。编译依赖使用同一个容器镜像里的产物。
+服务建议设置 --shutdown-timeout 30，给记录池排空及清理留出时间。
+本任务的 manage.py 同时核对整个任务进程组退出并清理对应的临时槽。
 服务启动必须设置 --additional-config '{"enable_cpu_binding":false}'：
 框架默认 CPU 绑定会写宿主机 IRQ 亲和性，不适用于本项目的宿主机只读边界。
 
@@ -23,11 +25,13 @@ feat/logits-flight-recorder 分支。不能只安装 Ascend 修改而漏掉 vLLM
 
 ```bash
 export VLLM_FLIGHT_RECORDER_DIR=/home/w00498770/dev/artifacts/vllm-023-logits-save/my-run/trace
+export VLLM_FLIGHT_RECORDER_BACKEND=cpu_pool
 export VLLM_FLIGHT_RECORDER_TOPK=128
 export VLLM_FLIGHT_RECORDER_PROBES=248044,248046
 export VLLM_FLIGHT_RECORDER_QUEUE=8
 ```
 
+默认 cpu_pool：NPU与固定页CPU/共享槽池，独立CPU进程4线程统计；inline为参考后端。
 不设置 VLLM_FLIGHT_RECORDER_DIR 即关闭。Top-K 记录配置不改变 sampling top_k。
 EOS probe 必须与实际模型及停止 token 对应。完整启动命令及环境见每个 run 的 manifest.json
 和任务 artifacts 根目录 launch.json。
@@ -52,7 +56,8 @@ python analyze.py /path/to/run/trace html --request REQUEST_ID \
 ```
 
 查询/审计仅需 Python + NumPy，不需要 NPU/vLLM。HTML导出还需要本地对应 tokenizer 和
-Transformers。生成的 HTML 不访问 CDN、不需要服务器；同目录 JSON 可用页面的文件选择器载入。
+Transformers。页面支持原始/处理后分布、采样排名>1、所选token概率阈值、同一步Top1-Top2概率差阈值，条件按AND组合；默认排除停止后的丢弃尾部。
+生成的 HTML 不访问 CDN、不需要服务器；同目录 JSON 可用页面的文件选择器载入。
 默认只导出一个请求，避免把整个测试集的压缩二进制膨胀成大量文本。
 
 ## 测试

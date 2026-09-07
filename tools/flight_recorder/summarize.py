@@ -17,7 +17,7 @@ def metric(text, name):
 
 def summarize():
     results={"performance":[],"storage":[],"output_comparison":[]}
-    for name in ("baseline-final","top128-final","top1024-final"):
+    for name in ("baseline-final","top128-final","top1024-final","pooled128","pooled1024"):
         root=ART/name
         for c in (1,4):
             file=root/f"c{c}.json"
@@ -55,12 +55,22 @@ def summarize():
                     t=store.token(row);steps+=1;sources[t["source"]]+=1;graphs[t["graph_mode"]]+=1
                     for stage in masses:
                         if np.isfinite(t[stage]["topk_mass"]):masses[stage].append(t[stage]["topk_mass"])
+            pool_info=[json.loads(p.read_text()) for p in (root/"trace").glob("pool-*.json")]
+            frame_meta=[]
+            for _,db in store.shards:
+                frame_meta.extend(json.loads(row[0]) for row in db.execute("SELECT meta FROM chunks"))
+            profile={}
+            for key in ("pool_wait_ns","capture_cpu_ns","cpu_statistics_ns"):
+                values=[m[key]/1e6 for m in frame_meta if key in m and all("-warm" not in r for r in m["req_ids"])]
+                if values:
+                    profile[key.replace("_ns","_ms")]={"median":float(np.median(values)),"p95":float(np.percentile(values,95)),"max":max(values)}
             bytes_=sum(p.stat().st_size for p in (root/"trace").iterdir() if p.is_file())
             results["storage"].append({
                 "run":name,"recorded_tokens":steps,"bytes":bytes_,
                 "bytes_per_token":bytes_/steps if steps else None,
                 "trace_complete":audit["complete"],"requests":len(audit["requests"]),
                 "sources":dict(sources),"graph_modes":dict(graphs),
+                "pool_info":pool_info,"recording_profile":profile,
                 "topk_mass":{s:{"min":min(m),"median":float(np.median(m)),
                                 "p05":float(np.percentile(m,5))} if m else {} for s,m in masses.items()}})
     result=clean(results)

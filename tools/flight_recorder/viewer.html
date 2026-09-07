@@ -25,7 +25,7 @@ th{position:sticky;top:0;background:#edf3f8}.scroll{max-height:470px;overflow:au
 <div class="grid"><section><b>实际输入</b><pre id="prompt"></pre></section><section><b>最终输出</b><pre id="output"></pre></section></div>
 <section><b>筛选生成位置</b>
 <div class="controls">
-<label>筛选依据 <select id="filterStage"><option value="final">处理后分布</option><option value="raw">原始分布</option></select></label>
+<label>筛选依据 <select id="filterStage" aria-label="筛选依据"><option value="final">处理后分布</option><option value="raw">原始分布</option></select></label>
 <label><input type="checkbox" id="filterRank"> 采样排名 &gt; 1</label>
 <label><input type="checkbox" id="filterProb"> 采样概率 &lt; <input id="probThreshold" type="number" min="0" max="1" step="0.01" value="0.2" style="width:85px" aria-label="采样概率阈值"></label>
 <label><input type="checkbox" id="filterGap"> Top1−Top2 概率差 &lt; <input id="gapThreshold" type="number" min="0" max="1" step="0.01" value="0.05" style="width:85px" aria-label="概率差阈值"></label>
@@ -91,7 +91,7 @@ function select(i){
  ['raw','final'].map(s=>{let d=r[s],m=metrics(r,s);return s+': 采样排名 '+m.rank+'，logit '+fmt(d.probe_logits[0])+'，概率 '+fmt(m.prob)+'，Top1−Top2 概率差 '+fmt(m.gap)+'\n'+r.probe_ids.slice(1).map((id,j)=>'结束候选 '+id+' 排名 '+d.probe_ranks[j+1]+' logit '+fmt(d.probe_logits[j+1])).join('；')}).join('\n');
  for(let stage of ['raw','final']){
  let d=r[stage];$(stage+'stats').textContent='覆盖率 '+fmt(d.topk_mass)+' · 有限候选 '+d.counts[0]+' · NaN/+Inf/−Inf '+d.counts.slice(1).join('/');
- let table=document.createElement('table'),head=document.createElement('tr');['排名','ID','Token','Logit','概率'].forEach(x=>{let th=document.createElement('th');th.textContent=x;head.appendChild(th)});table.appendChild(head);
+ let table=document.createElement('table'),head=document.createElement('tr');['序号','ID','Token','Logit','概率'].forEach(x=>{let th=document.createElement('th');th.textContent=x;head.appendChild(th)});table.appendChild(head);
  let search=$('search').value.toLowerCase(),shown=0;
  d.ids.forEach((id,j)=>{if(shown>=+$('limit').value)return;let txt=label(id);if(search&&!String(id).includes(search)&&!txt.toLowerCase().includes(search))return;shown++;
  let tr=document.createElement('tr');if(id===r.token_id)tr.className='selected';

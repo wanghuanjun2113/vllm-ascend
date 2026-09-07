@@ -13,24 +13,75 @@ ART = Path("/home/w00498770/dev/artifacts/vllm-023-logits-save")
 BASE = Path("/home/w00498770/dev/worktrees/vllm-023-logits-save")
 
 
+def group_members(pgid):
+    members = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry/"stat").read_text().rsplit(")",1)[1].split()
+            if fields[0] != "Z" and int(fields[2]) == pgid and int(fields[3]) == pgid:
+                members.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return members
+
+
+def cleanup_snapshot_files(owners, server_pid):
+    removed = []
+    for owner in owners:
+        proc = Path(f"/proc/{owner}/stat")
+        if proc.exists():
+            try:
+                if proc.read_text().rsplit(")",1)[1].split()[0] != "Z":
+                    continue
+            except FileNotFoundError:
+                pass
+        for path in Path("/dev/shm").glob(f"vllm-logits-{owner}-*"):
+            if path.is_file() and path.stat().st_uid == os.getuid():
+                removed.append({"path":str(path),"bytes":path.stat().st_size})
+                path.unlink()
+    if removed:
+        (ART/f"pool-cleanup-{server_pid}.json").write_text(json.dumps(
+            {"ownership":"verified task server session, after all members exited",
+             "removed":removed},indent=2))
+
+
 def stop():
     path = ART / "server.pid"
     if not path.exists():
         return
     pid = int(path.read_text())
     proc = Path(f"/proc/{pid}/cmdline")
-    if not proc.exists():
+    if not proc.exists() or not proc.read_bytes():
+        if group_members(pid):
+            raise RuntimeError("API exited with orphan workers; verify task ownership before cleanup")
         return
     command = proc.read_bytes()
     if b"vllm.entrypoints.openai.api_server" not in command or b"18327" not in command:
         raise RuntimeError("PID is not the task-owned server")
+    if os.getpgid(pid) != pid:
+        raise RuntimeError("server is not in its task-owned session")
+    owners = set(group_members(pid))
     os.kill(pid, signal.SIGTERM)
     for _ in range(150):
-        if not proc.exists():
+        current = group_members(pid)
+        owners.update(current)
+        if not current:
+            cleanup_snapshot_files(owners, pid)
             return
         time.sleep(0.1)
-    # Failed initializations can ignore SIGTERM. This session belongs to this launcher.
-    os.killpg(pid, signal.SIGKILL)
+    # Ownership was verified while the original session leader was alive.
+    if group_members(pid):
+        os.killpg(pid, signal.SIGKILL)
+    for _ in range(50):
+        current = group_members(pid)
+        owners.update(current)
+        if not current:
+            cleanup_snapshot_files(owners, pid)
+            return
+        time.sleep(0.1)
+    raise RuntimeError("task worker group did not exit")
 
 
 def start(name, k):

@@ -83,6 +83,8 @@ class SnapshotPool:
             raise RuntimeError("snapshot copy failed; trace incomplete") from self.error
 
     def capture(self, runner, logits, spec):
+        if self.closed:
+            raise RuntimeError("snapshot pool is closed")
         self.check()
         start = time.perf_counter_ns()
         while True:
@@ -151,15 +153,21 @@ class SnapshotPool:
         if self.closed:
             return
         self.closed = True
-        self.flush()
-        self.jobs.put(None)
-        self.thread.join()
-        self.writer.close()
-        info = {**self.info,"submitted":self.submitted,"completed":self.completed,
-                "max_pending":self.max_pending,"acquire_total_ns":self.wait_ns}
-        (self.writer.root/f"pool-{os.getpid()}.json").write_text(json.dumps(info,indent=2))
-        self.shared._mmap.close()
-        os.unlink(self.path)
+        try:
+            self.flush()
+            self.jobs.put(None)
+            self.thread.join()
+            self.writer.close()
+            info = {**self.info,"submitted":self.submitted,"completed":self.completed,
+                    "max_pending":self.max_pending,"acquire_total_ns":self.wait_ns}
+            (self.writer.root/f"pool-{os.getpid()}.json").write_text(json.dumps(info,indent=2))
+            self.shared._mmap.close()
+        finally:
+            # Unlinking does not invalidate mappings still owned by a failed worker.
+            # It prevents tmpfs files surviving an aborted recorder process.
+            if os.path.exists(self.path):
+                os.unlink(self.path)
+
 
 
 class PooledCapture:

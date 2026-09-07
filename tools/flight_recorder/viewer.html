@@ -23,6 +23,15 @@ th{position:sticky;top:0;background:#edf3f8}.scroll{max-height:470px;overflow:au
 <label>载入导出的记录 JSON <input id="file" type="file" accept=".json"></label></header>
 <section id="summary"></section>
 <div class="grid"><section><b>实际输入</b><pre id="prompt"></pre></section><section><b>最终输出</b><pre id="output"></pre></section></div>
+<section><b>筛选生成位置</b>
+<div class="controls">
+<label>筛选依据 <select id="filterStage"><option value="final">处理后分布</option><option value="raw">原始分布</option></select></label>
+<label><input type="checkbox" id="filterRank"> 采样排名 &gt; 1</label>
+<label><input type="checkbox" id="filterProb"> 采样概率 &lt; <input id="probThreshold" type="number" min="0" max="1" step="0.01" value="0.2" style="width:85px" aria-label="采样概率阈值"></label>
+<label><input type="checkbox" id="filterGap"> Top1−Top2 概率差 &lt; <input id="gapThreshold" type="number" min="0" max="1" step="0.01" value="0.05" style="width:85px" aria-label="概率差阈值"></label>
+<label><input type="checkbox" id="includeDiscarded"> 包含停止后丢弃的位置</label>
+<button id="clearFilters">清除筛选</button>
+</div><p id="filterCount" class="muted"></p><small>概率均按完整分布归一化。并列最高概率的候选排名均为 1；差值指同一步的 Top-1 与 Top-2。未知值不会匹配概率条件。箭头在匹配位置间跳转，输入框可直接定位任意位置。</small></section>
 <section><b>逐 token 浏览</b><p class="muted">曲线：原始 Top-K 概率覆盖率。黄色候选行为实际输出；候选概率以完整分布归一化。</p>
 <canvas id="chart" width="1300" height="100"></canvas><div id="tokens" class="tokens"></div>
 <div class="controls"><button id="prev">←</button><label>生成位置 <input id="pos" type="number" min="0" value="0" style="width:90px"></label>
@@ -35,37 +44,68 @@ th{position:sticky;top:0;background:#edf3f8}.scroll{max-height:470px;overflow:au
 <small>greedy 的 softmax 用于展示偏好，不是抽样概率。MTP 接受／拒绝过程不能仅用目标模型概率解释。
 未保存的长尾候选不可恢复；NaN、Inf 或被屏蔽值显示为“非有限值”，结合计数判断。</small></section>
 <script>
-let data=/*TRACE_DATA*/null, position=0;
+let data=/*TRACE_DATA*/null, position=0, filtered=[];
 const $=s=>document.getElementById(s), label=id=>data.labels[String(id)]??String(id);
 function cell(tr,text,cls){let td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;tr.appendChild(td);return td}
-function fmt(x){return typeof x==='string'?x:x===null||!Number.isFinite(x)?'非有限值':x.toPrecision(6)}
-function prob(v,lse){return !Number.isFinite(v)||!Number.isFinite(lse)?null:Math.exp(v-lse)}
+function fmt(x){return typeof x==='string'?x:x===null||!Number.isFinite(x)?'未知':x.toPrecision(9)}
+function prob(v,lse){if(v==='-inf'&&Number.isFinite(lse))return 0;return !Number.isFinite(v)||!Number.isFinite(lse)?null:Math.exp(v-lse)}
+function metrics(r,stage){let d=r[stage],p=prob(d.probe_logits[0],d.logsumexp),p1=prob(d.logits[0],d.logsumexp),p2=prob(d.logits[1],d.logsumexp);
+ return {rank:d.probe_ranks[0],prob:p,gap:p1===null||p2===null?null:p1-p2};}
 function draw(){
  if(!data)return;
  $('summary').textContent='请求 '+data.request.request_id+' · '+data.tokens.length+' 个采集 token · '+(data.audit.trace_complete?'记录校验通过':'记录不完整')+' · 停止原因 '+data.audit.finish_reason+' · 结束后未提交 token '+data.audit.unused_after_stop;
  $('prompt').textContent=data.prompt;$('output').textContent=data.output;
- $('config').textContent=JSON.stringify({sampling:data.request.sampling_params,stop_reason:data.request.stop_reason,audit:data.audit},null,2);
- $('tokens').replaceChildren();
- data.tokens.forEach((r,i)=>{let b=document.createElement('button');b.textContent=i+' '+label(r.token_id);b.onclick=()=>select(i);b.dataset.i=i;$('tokens').appendChild(b)});
+ $('config').textContent=JSON.stringify({sampling:data.request.sampling_params,sampling_encoding:data.request.sampling_params_encoding,stop_reason:data.request.stop_reason,audit:data.audit},null,2);
  const ctx=$('chart').getContext('2d');ctx.clearRect(0,0,1300,100);ctx.strokeStyle='#159aaa';ctx.beginPath();
  data.tokens.forEach((r,i)=>{let x=i*1300/Math.max(1,data.tokens.length-1),y=95-90*(Number.isFinite(r.raw.topk_mass)?r.raw.topk_mass:0);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();
- select(0);
+ position=0;applyFilters();
 }
-function select(i){if(!data||!data.tokens.length)return;position=Math.max(0,Math.min(data.tokens.length-1,i));$('pos').value=position;
+function applyFilters(){
+ if(!data)return;
+ const stage=$('filterStage').value,limitProb=+$('probThreshold').value,limitGap=+$('gapThreshold').value;
+ if(($('filterProb').checked&&(!Number.isFinite(limitProb)||limitProb<0||limitProb>1))||
+    ($('filterGap').checked&&(!Number.isFinite(limitGap)||limitGap<0||limitGap>1))){
+   $('filterCount').textContent='阈值须为 0 到 1 之间的数值。';return;}
+ let total=0,unknown=0;filtered=[];
+ data.tokens.forEach((r,i)=>{
+   if(!$('includeDiscarded').checked&&r.committed_to_output===false)return;total++;
+   let m=metrics(r,stage);
+   if(m.prob===null||m.gap===null)unknown++;
+   if($('filterRank').checked&&!(m.prob!==null&&m.rank>1))return;
+   if($('filterProb').checked&&!(m.prob!==null&&m.prob<limitProb))return;
+   if($('filterGap').checked&&!(m.gap!==null&&m.gap<limitGap))return;
+   filtered.push(i);
+ });
+ $('filterCount').textContent='匹配 '+filtered.length+' / '+total+' 个位置 · 条件按 AND 组合 · '+(stage==='final'?'处理后':'原始')+'分布'+(unknown?' · '+unknown+' 个位置存在未知概率或差值':'');
+ $('tokens').replaceChildren();
+ filtered.forEach(i=>{let r=data.tokens[i],b=document.createElement('button');b.textContent=r.position+' '+label(r.token_id);b.onclick=()=>select(i);b.dataset.i=i;$('tokens').appendChild(b)});
+ if(!filtered.length){$('detail').textContent='没有符合条件的 token。可调整或清除筛选；也可在生成位置输入框直接定位。';$('raw').replaceChildren();$('final').replaceChildren();$('rawstats').textContent='';$('finalstats').textContent='';return;}
+ select(filtered.includes(position)?position:filtered[0]);
+}
+function select(i){
+ if(!data||!data.tokens.length)return;
+ position=Math.max(0,Math.min(data.tokens.length-1,Math.trunc(i)));$('pos').value=position;
  document.querySelectorAll('.tokens button').forEach(b=>b.classList.toggle('active',+b.dataset.i===position));
- let r=data.tokens[position];$('detail').textContent='选中 '+r.token_id+' '+label(r.token_id)+' | 来源 '+r.source+' | '+r.selection_mode+' | Top-'+r.top_k+'\n'+
- ['raw','final'].map(s=>{let d=r[s];return s+': 选中排名 '+d.probe_ranks[0]+'，logit '+fmt(d.probe_logits[0])+'，概率 '+fmt(prob(d.probe_logits[0],d.logsumexp))+'；'+r.probe_ids.slice(1).map((id,j)=>'结束候选 '+id+' 排名 '+d.probe_ranks[j+1]+' logit '+fmt(d.probe_logits[j+1])).join('；')}).join('\n');
- for(let stage of ['raw','final']){let d=r[stage];$(stage+'stats').textContent='覆盖率 '+fmt(d.topk_mass)+' · 有限候选 '+d.counts[0]+' · NaN/+Inf/−Inf '+d.counts.slice(1).join('/');
+ let r=data.tokens[position];
+ $('detail').textContent='选中 '+r.token_id+' '+label(r.token_id)+' | 来源 '+r.source+' | '+r.selection_mode+' | Top-'+r.top_k+' | 图 '+(r.graph_mode??'未记录')+' | '+(r.committed_to_output===false?'停止后丢弃':'最终输出')+(filtered.includes(position)?'':' | 不符合当前筛选，直接定位查看')+'\n'+
+ ['raw','final'].map(s=>{let d=r[s],m=metrics(r,s);return s+': 采样排名 '+m.rank+'，logit '+fmt(d.probe_logits[0])+'，概率 '+fmt(m.prob)+'，Top1−Top2 概率差 '+fmt(m.gap)+'\n'+r.probe_ids.slice(1).map((id,j)=>'结束候选 '+id+' 排名 '+d.probe_ranks[j+1]+' logit '+fmt(d.probe_logits[j+1])).join('；')}).join('\n');
+ for(let stage of ['raw','final']){
+ let d=r[stage];$(stage+'stats').textContent='覆盖率 '+fmt(d.topk_mass)+' · 有限候选 '+d.counts[0]+' · NaN/+Inf/−Inf '+d.counts.slice(1).join('/');
  let table=document.createElement('table'),head=document.createElement('tr');['排名','ID','Token','Logit','概率'].forEach(x=>{let th=document.createElement('th');th.textContent=x;head.appendChild(th)});table.appendChild(head);
- let search=$('search').value.toLowerCase(), shown=0;
+ let search=$('search').value.toLowerCase(),shown=0;
  d.ids.forEach((id,j)=>{if(shown>=+$('limit').value)return;let txt=label(id);if(search&&!String(id).includes(search)&&!txt.toLowerCase().includes(search))return;shown++;
  let tr=document.createElement('tr');if(id===r.token_id)tr.className='selected';
  cell(tr,j+1);cell(tr,id);cell(tr,txt,'token');cell(tr,fmt(d.logits[j]));
  let p=prob(d.logits[j],d.logsumexp),td=cell(tr,fmt(p));let bar=document.createElement('div');bar.className='bar';bar.style.width=(Math.max(0,Math.min(1,p??0))*100)+'%';td.appendChild(bar);table.appendChild(tr)});
  $(stage).replaceChildren(table)}
 }
+function move(direction){if(!filtered.length)return;let candidates=filtered.filter(i=>direction>0?i>position:i<position);select(candidates.length?(direction>0?candidates[0]:candidates[candidates.length-1]):position)}
 $('file').onchange=async e=>{try{data=JSON.parse(await e.target.files[0].text());draw()}catch(e){$('summary').textContent='无法读取记录：'+e.message}};
-$('prev').onclick=()=>select(position-1);$('next').onclick=()=>select(position+1);
-$('pos').onchange=e=>select(+e.target.value);$('search').oninput=()=>select(position);$('limit').onchange=()=>select(position);
+$('prev').onclick=()=>move(-1);$('next').onclick=()=>move(1);
+$('pos').oninput=e=>{if(e.target.value!=='')select(+e.target.value)};
+$('search').oninput=()=>select(position);$('limit').onchange=()=>select(position);
+for(let id of ['filterStage','filterRank','filterProb','filterGap','includeDiscarded'])$(id).onchange=applyFilters;
+for(let id of ['probThreshold','gapThreshold'])$(id).oninput=applyFilters;
+$('clearFilters').onclick=()=>{for(let id of ['filterRank','filterProb','filterGap','includeDiscarded'])$(id).checked=false;applyFilters()};
 draw();
 </script></html>

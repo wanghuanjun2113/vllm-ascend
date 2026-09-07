@@ -384,6 +384,8 @@ class NPUWorker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         if model_runner := getattr(self, "model_runner", None):
+            if pool := getattr(model_runner, "_flight_snapshot_pool", None):
+                pool.close()
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
                 shutdown_fn()

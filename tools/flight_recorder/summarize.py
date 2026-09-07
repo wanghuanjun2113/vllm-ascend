@@ -17,7 +17,7 @@ def metric(text, name):
 
 def summarize():
     results={"performance":[],"storage":[],"output_comparison":[]}
-    for name in ("baseline","top128","top1024","baseline-final","top128-final"):
+    for name in ("baseline-final","top128-final","top1024-final"):
         root=ART/name
         for c in (1,4):
             file=root/f"c{c}.json"
@@ -39,8 +39,8 @@ def summarize():
                 "exact_answer_matches":sum(r["correct"] for r in rows),
                 "mtp_accepted":accepted,"mtp_proposed":proposed,
                 "mtp_acceptance":accepted/proposed if proposed else None})
-            if name!="baseline" and (ART/"baseline"/f"c{c}.json").exists():
-                base=json.loads((ART/"baseline"/f"c{c}.json").read_text())["results"]
+            if name!="baseline-final" and (ART/"baseline-final"/f"c{c}.json").exists():
+                base=json.loads((ART/"baseline-final"/f"c{c}.json").read_text())["results"]
                 pairs=list(zip(base,rows))
                 results["output_comparison"].append({
                     "run":name,"concurrency":c,

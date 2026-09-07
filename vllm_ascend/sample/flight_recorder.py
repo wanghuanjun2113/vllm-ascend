@@ -146,5 +146,14 @@ def begin(runner, logits, spec):
     transport().check()
     from vllm.v1.sample import flight_recorder
     flight_recorder.capture_callback = processed
-    _active = Capture(runner, logits, spec)
+    backend = os.getenv("VLLM_FLIGHT_RECORDER_BACKEND", "cpu_pool")
+    if backend == "inline":
+        _active = Capture(runner, logits, spec)
+    elif backend == "cpu_pool":
+        from vllm_ascend.sample.flight_recorder_pool import SnapshotPool
+        if not hasattr(runner, "_flight_snapshot_pool"):
+            runner._flight_snapshot_pool = SnapshotPool(runner, logits)
+        _active = runner._flight_snapshot_pool.capture(runner, logits, spec)
+    else:
+        raise ValueError("unknown flight recorder backend: " + backend)
     return _active

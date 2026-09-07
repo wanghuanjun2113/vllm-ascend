@@ -53,6 +53,18 @@ class TraceStore:
                     r["stop_reason"] = e["stop_reason"]
             elif e["kind"] == "abort":
                 r["finish_reason"] = "abort"
+        defaults_path = self.root.parent.parent / "sampling-defaults.json"
+        defaults = json.loads(defaults_path.read_text()) if defaults_path.exists() else None
+        for request in result.values():
+            if request.get("kind") == "request":
+                if request.get("sampling_params_complete"):
+                    request["sampling_params_encoding"] = "explicit runtime fields"
+                elif defaults is not None:
+                    request["sampling_params"] = {
+                        **defaults["values"], **request["sampling_params"]}
+                    request["sampling_params_encoding"] = "non-default fields + pinned class defaults"
+                else:
+                    request["sampling_params_encoding"] = "non-default fields only"
         return result
 
     def rows(self, rid):
@@ -136,7 +148,12 @@ class TraceStore:
             expected = request["output_token_ids"]
             contiguous = [x[0] for x in rows] == list(range(len(rows)))
             matched = ids[:len(expected)] == expected
-            checked = all(self.token(row)["token_id"] == row[1] and self.token(row)["final_seen"] for row in rows)
+            checked = True
+            for _, token_id, shard, chunk, row in rows:
+                arrays, _ = self.chunk(shard, chunk)
+                if int(arrays["selected"][row]) != token_id:
+                    raise ValueError("token index and payload disagree")
+                checked = checked and bool(arrays["final_seen"][row])
             complete = (request.get("kind") == "request" and not failures and contiguous and matched and checked
                         and len(ids) >= len(expected) and "finish_reason" in request)
             report.append({
@@ -153,6 +170,16 @@ class TraceStore:
     def export(self, rid, tokenizer):
         request = self.requests()[rid]
         rows = [self.token(x) for x in self.rows(rid)]
+        for row in rows:
+            row["committed_to_output"] = row["position"] < len(request["output_token_ids"])
+        manifest_path = self.root.parent / "manifest.json"
+        if manifest_path.exists():
+            expected = json.loads(manifest_path.read_text()).get("model_files", {})
+            for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json"):
+                if name in expected:
+                    path = Path(tokenizer) / name
+                    if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != expected[name]["sha256"]:
+                        raise ValueError("tokenizer snapshot mismatch: " + name)
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(tokenizer, local_files_only=True)
         ids = set(request.get("prompt_token_ids", []))
@@ -193,6 +220,8 @@ def main():
         if len(matches) != 1:
             raise ValueError("missing or ambiguous token")
         result = store.token(matches[0])
+        result["committed_to_output"] = args.position < len(
+            store.requests()[args.request]["output_token_ids"])
     else:
         result = store.export(args.request, args.tokenizer)
         template = Path(__file__).with_name("viewer.html").read_text()

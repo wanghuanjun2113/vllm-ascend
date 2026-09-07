@@ -38,8 +38,8 @@ th{position:sticky;top:0;background:#edf3f8}.scroll{max-height:470px;overflow:au
 let data=/*TRACE_DATA*/null, position=0;
 const $=s=>document.getElementById(s), label=id=>data.labels[String(id)]??String(id);
 function cell(tr,text,cls){let td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;tr.appendChild(td);return td}
-function fmt(x){return x===null||!Number.isFinite(x)?'非有限值':x.toPrecision(6)}
-function prob(v,lse){return v===null||lse===null?null:Math.exp(v-lse)}
+function fmt(x){return typeof x==='string'?x:x===null||!Number.isFinite(x)?'非有限值':x.toPrecision(6)}
+function prob(v,lse){return !Number.isFinite(v)||!Number.isFinite(lse)?null:Math.exp(v-lse)}
 function draw(){
  if(!data)return;
  $('summary').textContent='请求 '+data.request.request_id+' · '+data.tokens.length+' 个采集 token · '+(data.audit.trace_complete?'记录校验通过':'记录不完整')+' · 停止原因 '+data.audit.finish_reason+' · 结束后未提交 token '+data.audit.unused_after_stop;
@@ -48,7 +48,7 @@ function draw(){
  $('tokens').replaceChildren();
  data.tokens.forEach((r,i)=>{let b=document.createElement('button');b.textContent=i+' '+label(r.token_id);b.onclick=()=>select(i);b.dataset.i=i;$('tokens').appendChild(b)});
  const ctx=$('chart').getContext('2d');ctx.clearRect(0,0,1300,100);ctx.strokeStyle='#159aaa';ctx.beginPath();
- data.tokens.forEach((r,i)=>{let x=i*1300/Math.max(1,data.tokens.length-1),y=95-90*(r.raw.topk_mass??0);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();
+ data.tokens.forEach((r,i)=>{let x=i*1300/Math.max(1,data.tokens.length-1),y=95-90*(Number.isFinite(r.raw.topk_mass)?r.raw.topk_mass:0);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();
  select(0);
 }
 function select(i){if(!data||!data.tokens.length)return;position=Math.max(0,Math.min(data.tokens.length-1,i));$('pos').value=position;

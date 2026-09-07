@@ -88,12 +88,16 @@ async def main(args):
     (root / "cases.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
     async with httpx.AsyncClient(base_url=args.url, timeout=600.0, trust_env=False) as client:
         for i in range(args.warmup):
-            await request(client, data[i % len(data)], args.name+"-warm", args.temperature)
+            await request(client, data[i % len(data)], args.name+"-warm", args.temperature, args.max_tokens)
         for concurrency in args.concurrency:
+            # Warm the measured concurrency, including speculative kernels.
+            await asyncio.gather(*(request(client, c, args.name+f"-warm-c{concurrency}",
+                                           args.temperature, args.max_tokens)
+                                   for c in data[:concurrency]))
             sem = asyncio.Semaphore(concurrency)
             async def one(c):
                 async with sem:
-                    r = await request(client, c, args.name+f"-c{concurrency}", args.temperature)
+                    r = await request(client, c, args.name+f"-c{concurrency}", args.temperature, args.max_tokens)
                     print(args.name, concurrency, c["id"], r["usage"].get("completion_tokens"),
                           r["finish_reason"], round(r["e2e_s"],3),flush=True)
                     return r
@@ -117,6 +121,7 @@ if __name__ == "__main__":
     p.add_argument("--url", default="http://127.0.0.1:18327")
     p.add_argument("--n", type=int, default=8)
     p.add_argument("--warmup", type=int, default=4)
+    p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--concurrency", nargs="+", type=int, default=[1,4])
     p.add_argument("--temperature", type=float, default=0.0)
     asyncio.run(main(p.parse_args()))

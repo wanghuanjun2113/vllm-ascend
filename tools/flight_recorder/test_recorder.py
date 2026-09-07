@@ -128,3 +128,23 @@ def test_npu_capture_matches_full_vocab(k,tmp_path,monkeypatch):
         assert a[stage+"_probe_ranks"][0,0]>k
         assert a[stage+"_probe_values"][0,0]==raw[0,1].item()
     assert transport.arrays["final_counts"][0,3]==1
+
+
+def test_index_payload_mismatch(tmp_path,monkeypatch):
+    store=make_trace(tmp_path,monkeypatch)
+    db=sqlite3.connect(next(tmp_path.glob("*.sqlite")))
+    db.execute("UPDATE tokens SET token_id=99 WHERE request_id='a' AND position=0")
+    db.commit()
+    with pytest.raises(ValueError,match="disagree"):
+        store.token(store.rows("a")[0])
+
+
+def test_missing_processed_stage(tmp_path,monkeypatch):
+    monkeypatch.setenv("VLLM_FLIGHT_RECORDER_DIR",str(tmp_path))
+    m=load_writer();t=m.Transport()
+    t.submit({"kind":"request","request_id":"a","prompt_token_ids":[],"sampling_params":{}})
+    t.submit({"kind":"output","request_id":"a","token_ids":[1,2],"finish_reason":"stop","stop_reason":3})
+    meta,arrays=payload();arrays["final_seen"][0]=False
+    meta["discard_rows"]=[1]
+    t.submit(meta,arrays);t.close()
+    assert not TraceStore(tmp_path).audit()["complete"]

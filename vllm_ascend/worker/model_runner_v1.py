@@ -2378,6 +2378,7 @@ class NPUModelRunner(GPUModelRunner):
                 logits = broadcasted["logits"]
 
             # Apply structured output bitmasks if present
+            self._flight_graph_mode = cudagraph_mode.name
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
                 logits,

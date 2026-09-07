@@ -119,6 +119,7 @@ class Capture:
         rejection = get_ascend_config().rejection_sampler_config
         transport().submit({
             "kind": "batch", "req_ids": self.req_ids, "width": width,
+            "graph_mode": getattr(self.runner, "_flight_graph_mode", "unknown"),
             "discard_rows": self.runner.discard_request_indices.np[
                 :self.runner.num_discarded_requests].tolist(),
             "num_draft_tokens": drafts, "top_k": self.k,

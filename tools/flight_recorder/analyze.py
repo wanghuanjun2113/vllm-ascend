@@ -13,7 +13,7 @@ import numpy as np
 
 def clean(value):
     if isinstance(value, float) and not math.isfinite(value):
-        return None
+        return "nan" if math.isnan(value) else "+inf" if value > 0 else "-inf"
     if isinstance(value, dict):
         return {k: clean(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -85,6 +85,8 @@ class TraceStore:
     def token(self, item):
         pos, token, shard, chunk, row = item
         a, meta = self.chunk(shard, chunk)
+        if int(a["selected"][row]) != token:
+            raise ValueError("token index and payload disagree")
         out = {"position": pos, "token_id": token, "top_k": meta["top_k"],
                "probe_ids": [token] + meta["probe_ids"],
                "final_seen": bool(a["final_seen"][row])}
@@ -103,6 +105,7 @@ class TraceStore:
                              "accepted_draft" if step < accepted_length-1 else "replacement")
         else:
             out["source"] = "ordinary"
+        out["graph_mode"] = meta.get("graph_mode", "unknown")
         out["selection_mode"] = ("greedy" if meta["all_greedy"] else
                                  "random" if meta["all_random"] else "mixed")
         out["block_verify"] = meta["block_verify"]

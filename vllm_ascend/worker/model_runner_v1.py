@@ -2445,6 +2445,9 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        from vllm_ascend.sample.flight_recorder import begin
+        flight_capture = begin(self, logits, spec_decode_metadata)
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
@@ -2456,6 +2459,8 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if flight_capture is not None:
+            flight_capture.finish(sampler_output)
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:

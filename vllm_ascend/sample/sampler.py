@@ -179,6 +179,8 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             elif self.logprobs_mode == "processed_logprobs":
                 logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
+            from vllm_ascend.sample.flight_recorder import processed
+            processed(logits)
             probs = logits.softmax(dim=-1, dtype=torch.float32)
             if get_ascend_config().enable_async_exponential:
                 # Add synchronize to prevent synchronize error.

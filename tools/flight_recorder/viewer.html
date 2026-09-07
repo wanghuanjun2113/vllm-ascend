@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>推理记录 · 离线分析</title>
+<style>
+:root{font:15px/1.6 system-ui,sans-serif;color:#182c43;background:#f5f7fa}
+body{max-width:1440px;margin:auto;padding:24px}h1{font-size:25px;margin:0}
+small,.muted{color:#526678}header{display:flex;justify-content:space-between;align-items:center;gap:20px}
+section{background:white;border:1px solid #dbe3ec;border-radius:6px;padding:18px;margin:16px 0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;max-height:230px;overflow:auto}
+button,input,select{font:inherit;padding:6px;border:1px solid #bdccda;border-radius:4px;background:white}
+button{cursor:pointer}button:hover,button.active{background:#d9f3f4;border-color:#168592}
+.tokens{max-height:150px;overflow:auto}.tokens button{margin:2px;font-size:12px}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:7px;border-bottom:1px solid #e7edf3;text-align:left}
+td.token{max-width:220px;overflow-wrap:anywhere;white-space:pre-wrap}
+th{position:sticky;top:0;background:#edf3f8}.scroll{max-height:470px;overflow:auto}
+.bar{height:4px;background:#139baa;min-width:0}.selected{background:#fff2dd}
+.bad{color:#ae5614}.ok{color:#147c79}canvas{width:100%;height:90px}
+@media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:12px}header{display:block}}
+</style>
+<header><div><h1>推理记录 · 离线分析</h1><small>模型偏好 → 处理后的候选 → 实际输出</small></div>
+<label>载入导出的记录 JSON <input id="file" type="file" accept=".json"></label></header>
+<section id="summary"></section>
+<div class="grid"><section><b>实际输入</b><pre id="prompt"></pre></section><section><b>最终输出</b><pre id="output"></pre></section></div>
+<section><b>逐 token 浏览</b><p class="muted">曲线：原始 Top-K 概率覆盖率。黄色候选行为实际输出；候选概率以完整分布归一化。</p>
+<canvas id="chart" width="1300" height="100"></canvas><div id="tokens" class="tokens"></div>
+<div class="controls"><button id="prev">←</button><label>生成位置 <input id="pos" type="number" min="0" value="0" style="width:90px"></label>
+<button id="next">→</button><label>候选搜索 <input id="search" placeholder="token 文本或 ID"></label>
+<label>显示数量 <select id="limit"><option>20</option><option>128</option><option>512</option><option>1024</option></select></label></div>
+<pre id="detail"></pre></section>
+<div class="grid"><section><h3>模型输出 · 约束前</h3><div id="rawstats"></div><div class="scroll" id="raw"></div></section>
+<section><h3>目标模型 · 采样处理后</h3><div id="finalstats"></div><div class="scroll" id="final"></div></section></div>
+<section><b>采样与结束配置</b><pre id="config"></pre>
+<small>greedy 的 softmax 用于展示偏好，不是抽样概率。MTP 接受／拒绝过程不能仅用目标模型概率解释。
+未保存的长尾候选不可恢复；NaN、Inf 或被屏蔽值显示为“非有限值”，结合计数判断。</small></section>
+<script>
+let data=/*TRACE_DATA*/null, position=0;
+const $=s=>document.getElementById(s), label=id=>data.labels[String(id)]??String(id);
+function cell(tr,text,cls){let td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;tr.appendChild(td);return td}
+function fmt(x){return x===null||!Number.isFinite(x)?'非有限值':x.toPrecision(6)}
+function prob(v,lse){return v===null||lse===null?null:Math.exp(v-lse)}
+function draw(){
+ if(!data)return;
+ $('summary').textContent='请求 '+data.request.request_id+' · '+data.tokens.length+' 个采集 token · '+(data.audit.trace_complete?'记录校验通过':'记录不完整')+' · 停止原因 '+data.audit.finish_reason+' · 结束后未提交 token '+data.audit.unused_after_stop;
+ $('prompt').textContent=data.prompt;$('output').textContent=data.output;
+ $('config').textContent=JSON.stringify({sampling:data.request.sampling_params,stop_reason:data.request.stop_reason,audit:data.audit},null,2);
+ $('tokens').replaceChildren();
+ data.tokens.forEach((r,i)=>{let b=document.createElement('button');b.textContent=i+' '+label(r.token_id);b.onclick=()=>select(i);b.dataset.i=i;$('tokens').appendChild(b)});
+ const ctx=$('chart').getContext('2d');ctx.clearRect(0,0,1300,100);ctx.strokeStyle='#159aaa';ctx.beginPath();
+ data.tokens.forEach((r,i)=>{let x=i*1300/Math.max(1,data.tokens.length-1),y=95-90*(r.raw.topk_mass??0);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();
+ select(0);
+}
+function select(i){if(!data||!data.tokens.length)return;position=Math.max(0,Math.min(data.tokens.length-1,i));$('pos').value=position;
+ document.querySelectorAll('.tokens button').forEach(b=>b.classList.toggle('active',+b.dataset.i===position));
+ let r=data.tokens[position];$('detail').textContent='选中 '+r.token_id+' '+label(r.token_id)+' | 来源 '+r.source+' | '+r.selection_mode+' | Top-'+r.top_k+'\n'+
+ ['raw','final'].map(s=>{let d=r[s];return s+': 选中排名 '+d.probe_ranks[0]+'，logit '+fmt(d.probe_logits[0])+'，概率 '+fmt(prob(d.probe_logits[0],d.logsumexp))+'；'+r.probe_ids.slice(1).map((id,j)=>'结束候选 '+id+' 排名 '+d.probe_ranks[j+1]+' logit '+fmt(d.probe_logits[j+1])).join('；')}).join('\n');
+ for(let stage of ['raw','final']){let d=r[stage];$(stage+'stats').textContent='覆盖率 '+fmt(d.topk_mass)+' · 有限候选 '+d.counts[0]+' · NaN/+Inf/−Inf '+d.counts.slice(1).join('/');
+ let table=document.createElement('table'),head=document.createElement('tr');['排名','ID','Token','Logit','概率'].forEach(x=>{let th=document.createElement('th');th.textContent=x;head.appendChild(th)});table.appendChild(head);
+ let search=$('search').value.toLowerCase(), shown=0;
+ d.ids.forEach((id,j)=>{if(shown>=+$('limit').value)return;let txt=label(id);if(search&&!String(id).includes(search)&&!txt.toLowerCase().includes(search))return;shown++;
+ let tr=document.createElement('tr');if(id===r.token_id)tr.className='selected';
+ cell(tr,j+1);cell(tr,id);cell(tr,txt,'token');cell(tr,fmt(d.logits[j]));
+ let p=prob(d.logits[j],d.logsumexp),td=cell(tr,fmt(p));let bar=document.createElement('div');bar.className='bar';bar.style.width=(Math.max(0,Math.min(1,p??0))*100)+'%';td.appendChild(bar);table.appendChild(tr)});
+ $(stage).replaceChildren(table)}
+}
+$('file').onchange=async e=>{try{data=JSON.parse(await e.target.files[0].text());draw()}catch(e){$('summary').textContent='无法读取记录：'+e.message}};
+$('prev').onclick=()=>select(position-1);$('next').onclick=()=>select(position+1);
+$('pos').onchange=e=>select(+e.target.value);$('search').oninput=()=>select(position);$('limit').onchange=()=>select(position);
+draw();
+</script></html>

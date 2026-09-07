@@ -185,6 +185,10 @@ class AscendRejectionSampler(RejectionSampler):
         # won't affect the original logits tensor.
         assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
+        from vllm_ascend.sample.flight_recorder import current
+        flight_capture = current()
+        if flight_capture is not None:
+            flight_capture.rows = bonus_logits_indices
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -232,6 +236,9 @@ class AscendRejectionSampler(RejectionSampler):
             target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
         )
 
+        if flight_capture is not None:
+            flight_capture.rows = target_logits_indices
+            flight_capture.processed(target_logits)
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,

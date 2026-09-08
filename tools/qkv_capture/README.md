@@ -73,3 +73,13 @@ corpus/sources.json: source URLs / authored content tags / source hashes.
 
 The runner explicitly shuts down its engine and removes its control file.
 Verify process exit and npu-smi after use; never stop another task's processes.
+
+## Verified run (2026-09-08)
+
+Runtime source: b6511da55e0daa753513256484d51954a5086429.
+Run: qkv_20260908_v4. All 42 requests and 420 layer records passed.
+Raw shards: 840; merged files: 420; merged bytes: 5167494180.
+Maximum sampled FP32 replay NRMSE: 0.00196946.
+First-request capture off/on token IDs and compared logprobs matched exactly.
+Five unit tests passed. NPU2/3 inference processes exited and resource release
+was verified with npu-smi. See the artifact root's results.json and 数据说明.md.

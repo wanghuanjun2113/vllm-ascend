@@ -12,7 +12,10 @@ vLLM-Ascend parent: 5cb98caaadeff42b5b62b996e34bb2aaa29d20fd.
 Python 3.12.13, torch 2.10.0+cpu, torch-npu 2.10.0.post4, CANN 9.1.0.
 Artifacts: /home/w00498770/dev/artifacts/vllm-023-qwen35-qkv/.
 The task worktree reuses shared libraries from this same container's image;
-the library symlinks are not committed.
+the library symlinks are not committed. This includes lib64 and the vendors
+subdirectory under _cann_ops_custom (its tracked .gitkeep directory must stay).
+The launcher preserves the image PYTHONPATH and explicitly exposes the vendor
+OPP and op_api library paths before importing torch.
 
 ## Reproduce (inside the dedicated container)
 Start in /home/w00498770/dev/worktrees/vllm-023-qwen35-qkv/vllm-ascend.
@@ -27,7 +30,9 @@ revision from its frozen manifest, validates HTTP ranges and every SHA256.
 HF mirror returned HTTP 403 in the initial test. Weight data remain outside Git.
 
 ## Capture contract
-- Eager TP2, one request, complete unchunked prefill, no prefix cache or MTP.
+- Eager TP2 on NPU2/3, one request, no prefix cache or MTP. Chunked-prefill
+  scheduling remains enabled for model compatibility; the 8192-token budget
+  exceeds every prompt, and the capture validates one complete prefill.
 - CPU binding explicitly disabled because its default path changes host IRQ affinity.
 - Lengths: 10,128,256,512,1024,2048,4096 token IDs, with no chat template or extra BOS.
 - Six diagnostic document families; each longer sequence is a prefix extension

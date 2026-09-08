@@ -2,8 +2,10 @@
 set -euo pipefail
 cd /home/w00498770/dev/worktrees/vllm-023-qwen35-qkv/vllm-ascend
 test -f /home/w00498770/dev/artifacts/vllm-023-qwen35-qkv/weights/Qwen3.5-35B-A3B/VERIFIED.json
-export PYTHONPATH="$PWD:/vllm-workspace/vllm"
-export ASCEND_RT_VISIBLE_DEVICES=0,1
+export PYTHONPATH="$PWD:/vllm-workspace/vllm${PYTHONPATH:+:$PYTHONPATH}"
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export ASCEND_CUSTOM_OPP_PATH="$PWD/vllm_ascend/_cann_ops_custom/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export LD_LIBRARY_PATH="$PWD/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OMP_NUM_THREADS=8
 export OMP_PROC_BIND=false
 export HCCL_BUFFSIZE=200

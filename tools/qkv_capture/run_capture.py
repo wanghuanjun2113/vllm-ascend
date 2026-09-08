@@ -40,7 +40,7 @@ def main():
     config=dict(model=str(MODEL),tensor_parallel_size=2,dtype="bfloat16",
                 max_model_len=8192,max_num_seqs=1,max_num_batched_tokens=8192,
                 gpu_memory_utilization=0.82,enforce_eager=True,
-                enable_prefix_caching=False,enable_chunked_prefill=False,
+                enable_prefix_caching=False,enable_chunked_prefill=True,
                 async_scheduling=False,language_model_only=True,
                 additional_config={"enable_cpu_binding":False},
                 limit_mm_per_prompt={"image":0,"video":0},

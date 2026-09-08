@@ -1,0 +1,87 @@
+
+# V band/tail empirical prior: calibration-only, no dynamic code changes.
+_BP_PARENT_CALIBRATION = hif4_calibration_attention
+_BP_PARENT_Q = hif4_dynamic_quantize_q
+_BP_PARENT_K = hif4_dynamic_quantize_k
+_BP_PARENT_V = hif4_dynamic_quantize_v
+_BP_REPORT = []
+
+
+def _bp_mix_state(state, samples, weight):
+    if weight == 0.0:
+        return state
+    if "ownership_schema" in state:
+        return dict(state, common=_bp_mix_state(state["common"], samples, weight))
+    base = state["base"]
+    supported = [int(s["q"][0].shape[0]) for s in samples
+                 if int(s["q"][0].shape[0]) in _BP_PRIOR]
+    if not supported:
+        return state
+    prior_pool = torch.tensor([_BP_PRIOR[t]["lags"] for t in supported],
+                              dtype=torch.float32).mean(0)[None]
+    adjacent = (1-weight)*base["adjacent_mass"] + weight*prior_pool
+    mass = base["length_mass"].clone()
+    for index, token_count in enumerate(base["lengths"].tolist()):
+        if token_count in _BP_PRIOR:
+            template = torch.tensor(_BP_PRIOR[token_count]["lags"],dtype=torch.float32)[None]
+            mass[index] = (1-weight)*mass[index] + weight*template
+    tails = dict(base.get("tail_mass", {}))
+    for key, value in tails.items():
+        token_count = int(key)
+        if token_count in _BP_PRIOR:
+            tails[key] = ((1-weight)*value +
+                          weight*_BP_PRIOR[token_count]["tail_ratio"]*token_count).contiguous()
+    updated = dict(base, adjacent_mass=adjacent.contiguous(),
+                   length_mass=mass.contiguous(), tail_mass=tails)
+    return dict(state, base=updated)
+
+
+def _bp_observe(sample, states, qh, kh, dim):
+    q,k,v = [_dequantize_nvfp4_fp32(*sample[role]) for role in ("q","k","v")]
+    qp = _BP_PARENT_Q(*sample["q"], qh, dim, states["q_state"])
+    kp = _BP_PARENT_K(*sample["k"], kh, dim, states["k_state"])
+    qhat = _decode_params(qp, tuple(q.shape))
+    khat = _decode_params(kp, tuple(k.shape))
+    t = q.shape[0]
+    rows = (torch.arange(t) if t <= 512 else
+            torch.linspace(0,t-1,128).round().long().unique())
+    reference = _vfp_score_rows(q,k,v,rows,qh,kh,dim)
+    return qhat,khat,v,rows,reference
+
+
+@torch.inference_mode()
+def hif4_calibration_attention(calib_qkv_list,q_num_heads,kv_num_heads,head_dim):
+    parent = _BP_PARENT_CALIBRATION(calib_qkv_list,q_num_heads,kv_num_heads,head_dim)
+    qh,kh,dim = q_num_heads,kv_num_heads,head_dim
+    if (qh,kh,dim)!=(16,2,256):
+        return parent
+    if _BP_MODE == "offline":
+        state = _bp_mix_state(parent["v_state"],calib_qkv_list,1.0)
+        _BP_REPORT.append({"lambda":1.0})
+        return dict(parent,v_state=state)
+    if len(calib_qkv_list)<4:
+        _BP_REPORT.append({"lambda":0.0,"reason":"few_calibration_samples"})
+        return parent
+    ordered = sorted(range(len(calib_qkv_list)),key=lambda i:int(calib_qkv_list[i]["q"][0].shape[0]))
+    indices = sorted(set((ordered[1],ordered[-2])))
+    observed = [_bp_observe(calib_qkv_list[i],parent,qh,kh,dim) for i in indices]
+    states = {w:_bp_mix_state(parent["v_state"],calib_qkv_list,w) for w in (0.0,0.1,0.25)}
+    losses = {}
+    for weight,state in states.items():
+        values=[]
+        for index,(qhat,khat,raw_v,rows,reference) in zip(indices,observed):
+            sample=calib_qkv_list[index]
+            vp=_BP_PARENT_V(*sample["v"],kh,dim,state)
+            vh=_decode_params(vp,tuple(raw_v.shape))
+            output=_vfp_score_rows(qhat,khat,vh,rows,qh,kh,dim)
+            values.append(float((output.double()-reference.double()).square().mean()))
+        losses[weight]=values
+    ratios={w:[x/max(y,1e-30) for x,y in zip(values,losses[0.0])]
+            for w,values in losses.items()}
+    choices=[w for w in (0.1,0.25) if all(math.isfinite(x) and x<=1.001 for x in ratios[w])
+             and sum(ratios[w])/len(indices)<0.999]
+    selected=min(choices,key=lambda w:sum(ratios[w])) if choices else 0.0
+    _BP_REPORT.append({"lambda":selected,"calibration_indices":indices,"ratios":ratios})
+    if selected==0.0:
+        return parent
+    return dict(parent,v_state=states[selected])

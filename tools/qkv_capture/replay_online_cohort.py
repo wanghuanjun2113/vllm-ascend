@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run a frozen online cohort with the project's normal CPU-lease evaluator."""
-import argparse,hashlib,json,os,re,subprocess,sys,time
+import argparse,hashlib,json,os,re,subprocess,sys,time,urllib.request
 from pathlib import Path
 
 PROJECT=Path("/home/w00498770/algo/algorithm_9_7_2")
@@ -34,7 +34,22 @@ def main():
   assert sha(DATA/args.bank/g["path"])==g["sha256"]
  for candidate in cohort["schemes"]:
   sid=candidate["id"];source=TEMP/"sources"/sid/"solution.py"
+  if not source.exists():
+   url=f"https://raw.githubusercontent.com/pjgao/hw_competetion_2026/{candidate['sha']}/{candidate['owner']}/{candidate['name']}/solution.py"
+   with urllib.request.urlopen(url,timeout=60) as response:
+    body=response.read()
+   assert hashlib.sha256(body).hexdigest()==candidate["source_sha256"]
+   source.parent.mkdir(parents=True,exist_ok=True)
+   source.write_bytes(body)
   assert sha(source)==candidate["source_sha256"]
+  saved=RESULT/f"{sid}_{args.bank}.json"
+  if saved.exists():
+   previous=json.loads(saved.read_text())
+   if previous["status"]=="complete":
+    assert previous["source_sha256"]==candidate["source_sha256"]
+    assert previous["bank_manifest_sha256"]==expected_bank
+    print("REUSE_COMPLETE",sid,args.bank,flush=True)
+    continue
   log=TEMP/"logs"/f"{sid}_{args.bank}.log"
   cmd=[sys.executable,str(PROJECT/"scripts/test_machine.py"),
        "--owner",f"qwen35-{sid}-{args.bank}","--cpus",args.cpus,

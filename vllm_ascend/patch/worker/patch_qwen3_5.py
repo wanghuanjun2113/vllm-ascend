@@ -34,6 +34,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p
+from vllm_ascend.patch.worker.qkv_capture import capture_inputs, finish_capture
 
 _GDN_PATCH_TARGET = _GDNBaseCls
 
@@ -78,7 +79,9 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
             q, k = self.rotary_emb(positions, q, k)
 
+        capture = capture_inputs(self, positions, q, k, v)
         attn_output = self.attn(q, k, v)
+        finish_capture(capture, attn_output)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

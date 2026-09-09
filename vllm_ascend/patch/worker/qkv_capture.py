@@ -1,6 +1,7 @@
 """Opt-in synchronous capture of actual Full Attention inputs (eager, one request)."""
 import json
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -15,6 +16,9 @@ def capture_inputs(module, positions, q, k, v):
     from vllm.forward_context import get_forward_context
 
     control = json.loads(Path(_CONTROL).read_text())
+    layer_index = int(re.search(r"layers\.(\d+)\.", module.attn.layer_name).group(1))
+    if "layers" in control and layer_index not in control["layers"]:
+        return None
     context = get_forward_context()
     metadata = context.attn_metadata
     if metadata is None:  # engine profile / warmup is never a dataset sample

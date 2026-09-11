@@ -1,0 +1,1052 @@
+diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/vllm/v1/worker/gpu_model_runner.py
+@@ -4855,6 +4855,13 @@
+         draft_token_ids: torch.Tensor = self._draft_token_ids
+         if not torch.is_tensor(draft_token_ids):
+             return
++        # Fast path (zcode): the drafter returns a swapaxes() view (non
++        # contiguous). A pinned D2H copy_ with a non-contiguous source falls
++        # back to a staging path that blocks the host until the whole stream
++        # drains (~verify duration each step on 310P); make it contiguous so
++        # the copy stays truly async on the copy stream.
++        if not draft_token_ids.is_contiguous():
++            draft_token_ids = draft_token_ids.contiguous()
+         assert self.draft_token_ids_event is not None
+         assert self.draft_token_ids_copy_stream is not None
+         assert self.draft_token_ids_cpu is not None
+diff --git a/vllm-ascend/tests/ut/_310p/ops/test_chunk_gated_delta_rule_310.py b/vllm-ascend/tests/ut/_310p/ops/test_chunk_gated_delta_rule_310.py
+--- a/vllm-ascend/tests/ut/_310p/ops/test_chunk_gated_delta_rule_310.py
++++ b/vllm-ascend/tests/ut/_310p/ops/test_chunk_gated_delta_rule_310.py
+@@ -4,7 +4,10 @@
+ import torch
+ import torch_npu
+ 
+-from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_pytorch
++from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import (
++    chunk_gated_delta_rule_pytorch,
++    _compute_kernel_inputs_from_torch_wy,
++)
+ 
+ 
+ def _cpu_rms_norm(x, weight, eps):
+@@ -145,3 +148,31 @@
+     assert final_state_tnd is not None
+     assert final_state_bthd is not None
+     torch.testing.assert_close(final_state_tnd, final_state_bthd, rtol=1e-4, atol=1e-4)
++
++
++@pytest.mark.parametrize('seed', [0, 1, 2])
++def test_wy_state_transform_applies_decay_once(seed):
++    """The state transform uses beta * exp(g), not beta * exp(2*g)."""
++    torch.manual_seed(seed)
++    q = torch.nn.functional.normalize(torch.randn(1, 64, 2, 16), dim=-1).half()
++    k = torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).half()
++    v = torch.randn(1, 64, 2, 16).half()
++    g = -torch.rand(1, 64, 2) * 0.1
++    beta = torch.rand(1, 64, 2).half()
++    _, _, actual_w, actual_u, _ = _compute_kernel_inputs_from_torch_wy(q, k, v, g, beta, 64)
++
++    key = k.transpose(1, 2).double()
++    decay = g.transpose(1, 2).double().cumsum(-1)
++    beta_ref = beta.transpose(1, 2).double()
++    lower = (-(key * beta_ref[..., None]) @ key.transpose(-1, -2))
++    lower *= (decay[..., :, None] - decay[..., None, :]).exp()
++    lower = lower.tril(-1)
++    system = torch.eye(64) - lower
++    expected_w = torch.linalg.solve_triangular(
++        system, key * (beta_ref * decay.exp())[..., None], upper=False, unitriangular=True
++    ).half()
++    expected_u = torch.linalg.solve_triangular(
++        system, v.transpose(1, 2).double() * beta_ref[..., None], upper=False, unitriangular=True
++    ).half()
++    torch.testing.assert_close(actual_w, expected_w, atol=2e-4, rtol=2e-3)
++    torch.testing.assert_close(actual_u, expected_u, atol=2e-3, rtol=2e-3)
+diff --git a/vllm-ascend/tests/ut/_310p/ops/test_gdn_310.py b/vllm-ascend/tests/ut/_310p/ops/test_gdn_310.py
+--- a/vllm-ascend/tests/ut/_310p/ops/test_gdn_310.py
++++ b/vllm-ascend/tests/ut/_310p/ops/test_gdn_310.py
+@@ -16,7 +16,9 @@
+ #
+ 
+ from types import SimpleNamespace
++from unittest.mock import patch
+ 
++import pytest
+ import torch
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+@@ -25,6 +27,7 @@
+     _mask_padded_recurrent_accepted_tokens,
+     _zero_padded_tokens,
+ )
++from vllm_ascend._310p.ops.fla import gdn_310
+ from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
+     AscendGDNAttentionBackend310,
+     AscendGDNAttentionMetadataBuilder310,
+@@ -139,3 +142,14 @@
+     assert conv_meta.cache_indices.data_ptr() == attn_metadata.non_spec_state_indices_tensor.data_ptr()
+     assert decode_meta.actual_seq_lengths.data_ptr() == builder.non_spec_actual_seq_lengths.data_ptr()
+     assert decode_meta.actual_seq_lengths.tolist() == [0, 1, 1, 0, 0]
++
++
++@pytest.mark.parametrize('lengths', [[4, 4], [4, 1, 3], [0, 4, 0, 2], [2, 2], [0, 0]])
++def test_flatten_state_indices_compacts_variable_sequences(lengths):
++    states = torch.arange(len(lengths) * 4, dtype=torch.int32).reshape(-1, 4)
++    cu = torch.zeros(len(lengths) + 1, dtype=torch.int32)
++    cu[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
++    expected = torch.cat([states[i, :n] for i, n in enumerate(lengths)])
++    with patch.object(gdn_310, '_EXTRA_CTX', SimpleNamespace(capturing=False)):
++        actual = gdn_310._flatten_state_indices(states, cu, sum(lengths))
++    torch.testing.assert_close(actual, expected)
+diff --git a/vllm-ascend/tests/ut/_310p/test_model_runner_310p.py b/vllm-ascend/tests/ut/_310p/test_model_runner_310p.py
+--- a/vllm-ascend/tests/ut/_310p/test_model_runner_310p.py
++++ b/vllm-ascend/tests/ut/_310p/test_model_runner_310p.py
+@@ -17,6 +17,7 @@
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++import pytest
+ import torch
+ from vllm.config import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+@@ -51,7 +52,8 @@
+     assert "self.optimistic_seq_lens_cpu[:num_reqs]" in source
+ 
+ 
+-def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
++@pytest.mark.parametrize("has_handles", [True, False])
++def test_model_forward_updates_mtp_full_graph_params_before_replay(has_handles) -> None:
+     runner = object.__new__(NPUModelRunner310)
+     runner.uses_mrope = False
+     runner.enable_enpu = False
+@@ -79,15 +81,32 @@
+     with patch(
+         "vllm_ascend._310p.model_runner_310p.get_forward_context",
+         return_value=forward_context,
+-    ):
++    ), patch(
++        "vllm_ascend._310p.model_runner_310p.get_graph_params",
++        return_value=SimpleNamespace(handles={8: [object()] if has_handles else []}),
++    ), patch("torch.npu.current_stream") as current_stream:
+         hidden_states = runner._model_forward(
+             8,
+             input_ids=torch.tensor([1]),
+             positions=torch.tensor([0]),
+         )
+ 
+-    assert calls == ["update", "model"]
++    assert calls == (["update", "model"] if has_handles else ["model", "update"])
++    assert current_stream.return_value.synchronize.call_count == int(has_handles)
+     torch.testing.assert_close(hidden_states, torch.ones(1))
++
++
++@pytest.mark.parametrize("parallel_drafting", [True, False])
++def test_reject_count_host_mirror_is_only_copied_for_parallel_drafting(parallel_drafting):
++    runner = object.__new__(NPUModelRunner310)
++    runner.speculative_config = SimpleNamespace(parallel_drafting=parallel_drafting)
++    runner.num_rejected_tokens_event = MagicMock()
++    runner.num_rejected_tokens_copy_stream = MagicMock()
++    runner.num_rejected_tokens_cpu = torch.full((2,), -1, dtype=torch.int32)
++    with patch("torch.npu.current_stream"), patch("torch.npu.stream"):
++        runner._copy_num_rejected_tokens(torch.tensor([3, 0], dtype=torch.int64))
++    assert runner.num_rejected_tokens_cpu.tolist() == ([3, 0] if parallel_drafting else [-1, -1])
++    assert runner.num_rejected_tokens_event.record.call_count == int(parallel_drafting)
+ 
+ 
+ class TestNPUModelRunner310(TestBase):
+diff --git a/vllm-ascend/tools/itl20/.gitignore b/vllm-ascend/tools/itl20/.gitignore
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/.gitignore
+@@ -0,0 +1,4 @@
++__pycache__/
++wy_solve_310p/build/
++wy_solve_310p/build_torch/
++wy_solve_310p/kernel_test.json
+diff --git a/vllm-ascend/tools/itl20/README.md b/vllm-ascend/tools/itl20/README.md
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/README.md
+@@ -0,0 +1,77 @@
++# 310P Qwen3.6 ITL 补丁
++
++本目录随单一 workspace patch 安装。仅支持以下已验证源码组合：
++
++- vLLM-Ascend：`f2f74a16c3c50a76f4349d807918e83edec1e35c`
++- vLLM：`568afb3a13806beb53bb2e6bd518269357b237c0`
++- aarch64、Ascend 310P3、CANN 9.1.0、torch 2.10.0、torch_npu 2.10.0.post4
++
++补丁合并了原工作树的必要前置修改和本轮保留优化，适用于上述 commit 的干净源码。
++不是针对仓库最新 main 的补丁，也不要重复应用到已经有相同修改的目录。
++保留原模型权重，不新增量化；已有 lm_head 量化支持代码不会自动修改或量化权重。
++
++## 应用和构建
++
++停止目标 Docker 中使用这些源码的服务后执行。先确认两个源码目录都在
++`/vllm-workspace` 下；不同位置可在对应共同父目录建立同名的源码副本后应用。
++
++```bash
++cd /vllm-workspace
++git -C vllm-ascend rev-parse HEAD
++git -C vllm rev-parse HEAD
++git apply --check /path/to/310p-qwen36-itl.patch
++git apply /path/to/310p-qwen36-itl.patch
++python3 vllm-ascend/tools/itl20/verify.py --ascend vllm-ascend --vllm vllm
++```
++
++校验应显示两个仓库均为 `optimized`。不符合时不要强制应用。
++修改前请保留目标源码备份。`git apply` 不安装 Python 包；当前 Python 必须实际
++从这两个源码目录导入 vLLM 与 vLLM-Ascend，而不是另一份 site-packages 副本。
++
++加载目标容器的 CANN 环境，使 `ASCEND_HOME_PATH` 指向其 CANN 安装目录。
++需要 cmake、C++ 编译工具、ninja，以及匹配的 torch/torch_npu 开发头文件。
++在目标容器内重新编译，不复制其他镜像的二进制：
++
++```bash
++bash vllm-ascend/tools/itl20/install_kernel.sh /vllm-workspace/vllm-ascend
++# 选择目标机器上可用的设备；下面的 0 仅为示例。
++ASCEND_RT_VISIBLE_DEVICES=0 TASK_QUEUE_ENABLE=0 \
++  python3 vllm-ascend/tools/itl20/wy_solve_310p/test_kernel.py
++```
++
++安装脚本会构建并安装 `libwy_solve_kernel.so` 和 `wy_solve_bindings.so`，
++位置为 `vllm_ascend/_wy_solve/`。两者缺一不可；完成构建前不要启动打过补丁的服务。
++测试成功后用原启动命令重启，并设置 `export TASK_QUEUE_ENABLE=0`。
++本次保留的是正常请求接纳与异步调度，没有批次解码优先策略。
++
++## 修改范围与验证
++
++- 复现前置工作树：拒绝采样快速路径、计数镜像、pinned 拷贝等已有修改；
++  vLLM 的一处前置补丁将 draft token 的非连续视图转为连续布局后再复制。
++- 本轮优化：减少无用 D2H/同步；GDN 状态索引在设备端构造；WY 重复衰减修复；
++  FP32、64×64 WY 递推 AscendC 算子。
++- 附带三个原有单元测试文件的增量和独立算子数值对拍脚本。
++- 不包含 WY v3、已回退的回放同步删除、批次等待策略或机器专属运行库。
++
++既有 WY 路径把衰减乘了两次，本补丁改为一次。因此这是包含数值纠错的优化，
++不能保证生成文本与错误基线逐字一致。此前定向 CPU 检查共 22 个用例通过；
++NPU 算子最大绝对误差 1.49e-8，生产形状整段 WY 的 W/U 相对误差约
++0.0341%/0.0355%；未做通用任务能力评测。
++
++原权重、TP4、MTP=3、图模式、8192 入/1024 出、4 并发、24 条请求的原环境实测：
++
++| 平均指标 | 原工作树基线 | 保留配置 |
++|---|---:|---:|
++| TTFT | 15.09 s | 13.36 s |
++| TPOT | 70.67 ms | 65.11 ms |
++| ITL | 180.13 ms | 163.70 ms |
++
++24/24 成功；ITL 降低 9.12%，尚未达到 20% 目标。这里的基线是前置修改后的
++工作树，不是干净 commit；结果不能直接推定为其他 Docker/硬件的收益。
++
++## 回退
++
++先停止目标服务。在共同父目录执行 `git apply --reverse --check`，确认没有
++后续冲突修改，再执行 `git apply --reverse` 回退同一个 patch。两个编译产生的
++运行库不在 patch 中；回退后原路径不再加载它们，可单独保留或清理。
++恢复启动环境中原来的 `TASK_QUEUE_ENABLE` 设置，再重启服务。
+diff --git a/vllm-ascend/tools/itl20/install_kernel.sh b/vllm-ascend/tools/itl20/install_kernel.sh
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/install_kernel.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ $# != 1 || ! -d "$1/vllm_ascend" ]]; then
++    echo "Usage: bash install_kernel.sh /path/to/vllm-ascend" >&2
++    exit 2
++fi
++: "${ASCEND_HOME_PATH:?Source the CANN environment before building}"
++kit=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++target=$(cd -- "$1" && pwd)
++source_dir="$kit/wy_solve_310p"
++cmake -S "$source_dir" -B "$source_dir/build" -DCMAKE_BUILD_TYPE=Release \
++    -DCMAKE_ASC_ARCHITECTURES=dav-2002 -DASCEND_COMPUTE_UNIT=ascend310p
++cmake --build "$source_dir/build" -j 8
++python3 "$source_dir/build_extension.py"
++mkdir -p "$target/vllm_ascend/_wy_solve"
++install -m 755 "$source_dir/build_torch/libwy_solve_kernel.so" \
++    "$target/vllm_ascend/_wy_solve/libwy_solve_kernel.so"
++install -m 755 "$source_dir/build_torch/wy_solve_bindings.so" \
++    "$target/vllm_ascend/_wy_solve/wy_solve_bindings.so"
++echo "Installed WY libraries in $target/vllm_ascend/_wy_solve"
+diff --git a/vllm-ascend/tools/itl20/manifest.json b/vllm-ascend/tools/itl20/manifest.json
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/manifest.json
+@@ -0,0 +1,57 @@
++{
++  "vllm_ascend_commit": "f2f74a16c3c50a76f4349d807918e83edec1e35c",
++  "vllm_commit": "568afb3a13806beb53bb2e6bd518269357b237c0",
++  "vllm_ascend": {
++    "tests/ut/_310p/ops/test_chunk_gated_delta_rule_310.py": {
++      "clean": "003331c456762c899756926161b9cf18d4898ca179a61b7c70a72ef96093d4a4",
++      "baseline": "003331c456762c899756926161b9cf18d4898ca179a61b7c70a72ef96093d4a4",
++      "optimized": "0ab1717ac0d8ef3ea107465afe1aa5334206b1af162f657d8bb533970f287ef5"
++    },
++    "tests/ut/_310p/ops/test_gdn_310.py": {
++      "clean": "87a6f10e6b604e43b890edcd07e289d88dd932448b6bcc6e110c24d8e7ddc392",
++      "baseline": "87a6f10e6b604e43b890edcd07e289d88dd932448b6bcc6e110c24d8e7ddc392",
++      "optimized": "942c7c06a39bfa9b1ee4e48d7166ae07544ec6199914112aac257c3635e2b21b"
++    },
++    "tests/ut/_310p/test_model_runner_310p.py": {
++      "clean": "3aa97bac5e107ac14c651532dbd8e3c4f9034b131a49a5f8c4a7a713c819a472",
++      "baseline": "3aa97bac5e107ac14c651532dbd8e3c4f9034b131a49a5f8c4a7a713c819a472",
++      "optimized": "3328dc90427e2735add582f6abd77fa7f221d570b22a97d616624c41053c2fa0"
++    },
++    "vllm_ascend/_310p/model_runner_310p.py": {
++      "clean": "248ac0ecf4efc70a0e6dd68ec3b45bdf21241a865d60e91165f3118132cfcfd1",
++      "baseline": "b75092fbb7ec6fa59074d045f03da98bb9fab4c9baf80674bc3120cc018ff0d6",
++      "optimized": "bdeaa2f3afe2b3c1115e6e938320cc74ffef9a5508483913999fe7027cac5f92"
++    },
++    "vllm_ascend/_310p/ops/fla/chunk_gated_delta_rule.py": {
++      "clean": "ab2b739bb6630ebe9fcb1d7af820f93adffce79668e32247bbb869119a0d6c69",
++      "baseline": "027d68626035960068b70a9406ea2efe7c8d0cc8dc53608c0d61e9003e1f645f",
++      "optimized": "cf1980c86df601a9eecef40c300843e331644d61e3a89a73860edef3fab7875c"
++    },
++    "vllm_ascend/_310p/ops/fla/gdn_310.py": {
++      "clean": "1282ed500116e01a31db76ac0c6e44dbb8fd4d476460a43c2c07512733c32548",
++      "baseline": "1282ed500116e01a31db76ac0c6e44dbb8fd4d476460a43c2c07512733c32548",
++      "optimized": "7fc09cbb4622ef44f62377340d126f6ea3763cefaa72fa781178827320be9569"
++    },
++    "vllm_ascend/_310p/quantization/modelslim_config.py": {
++      "clean": "f7b13050d26983649a83511736d3e74491e882484cb0dfb99d3202432e677f15",
++      "baseline": "ec09551f0a1449b80d70280533417e7fd00fab9ccf9f9f2760044e135aee7140",
++      "optimized": "ec09551f0a1449b80d70280533417e7fd00fab9ccf9f9f2760044e135aee7140"
++    },
++    "vllm_ascend/sample/rejection_sampler.py": {
++      "clean": "e90658be1c69a998ddedf48cd503c30e718855ce891085206e459f8af467edc1",
++      "baseline": "774a076060da1d2c6e9deb7b372e9ac9a8fcab78e6a9068cf06dcfd6b7e82132",
++      "optimized": "774a076060da1d2c6e9deb7b372e9ac9a8fcab78e6a9068cf06dcfd6b7e82132"
++    },
++    "vllm_ascend/worker/model_runner_v1.py": {
++      "clean": "4699af75ac8b4b55283d55190365e93d13820a05888bfa65aea8746deabc4d3a",
++      "baseline": "19904bb38a80da755fd8d744b91365dab398b6897f576b2e56dd3c576ff16fa1",
++      "optimized": "30864d9b13b2735b92b08ccce955aec5f762edf7a2e0965e3f783194c75adf47"
++    }
++  },
++  "vllm": {
++    "vllm/v1/worker/gpu_model_runner.py": {
++      "clean": "81b7627fbe81f7aaa2f77b4bf085faa353c69d03662ebfe369536a9773bb70d0",
++      "optimized": "a01054f63505672ab0ca4aa253c2db424599fe390aefb83629b7f42d6ef1a35c"
++    }
++  }
++}
+diff --git a/vllm-ascend/tools/itl20/test_verify.py b/vllm-ascend/tools/itl20/test_verify.py
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/test_verify.py
+@@ -0,0 +1,37 @@
++import hashlib
++import tempfile
++import unittest
++from pathlib import Path
++
++from verify import identify
++
++
++class VerifyTests(unittest.TestCase):
++    def test_known_states_and_mixed_changes(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            entries = {
++                name: {
++                    state: hashlib.sha256((name + state).encode()).hexdigest()
++                    for state in ("clean", "baseline", "optimized")
++                }
++                for name in ("a.py", "b.py")
++            }
++            for state in ("clean", "baseline", "optimized"):
++                for name in entries:
++                    (root / name).write_text(name + state)
++                self.assertEqual(identify(root, entries), state)
++            (root / "a.py").write_text("a.pyclean")
++            self.assertEqual(identify(root, entries), "unknown")
++            (root / "a.py").unlink()
++            self.assertEqual(identify(root, entries), "unknown")
++
++    def test_unrecognized_content(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            (root / "a.py").write_text("unrelated edits")
++            self.assertEqual(identify(root, {"a.py": {"clean": "wrong"}}), "unknown")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm-ascend/tools/itl20/verify.py b/vllm-ascend/tools/itl20/verify.py
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/verify.py
+@@ -0,0 +1,40 @@
++"""Read-only, byte-level preflight for the supported source states."""
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++
++def identify(root, entries):
++    states = None
++    for name, expected in entries.items():
++        path = root / name
++        if not path.is_file():
++            return "unknown"
++        digest = hashlib.sha256(path.read_bytes()).hexdigest()
++        matches = {state for state, value in expected.items() if value == digest}
++        states = matches if states is None else states & matches
++    for state in ("optimized", "baseline", "clean"):
++        if states and state in states:
++            return state
++    return "unknown"
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--ascend", type=Path, required=True)
++    parser.add_argument("--vllm", type=Path, required=True)
++    args = parser.parse_args()
++    manifest = json.loads(Path(__file__).with_name("manifest.json").read_text())
++    ascend_state = identify(args.ascend, manifest["vllm_ascend"])
++    vllm_state = identify(args.vllm, manifest["vllm"])
++    print(f"vllm-ascend: {ascend_state}; vllm: {vllm_state}")
++    if "unknown" in (ascend_state, vllm_state):
++        parser.exit(
++            2, "Source differs from supported states; do not force-apply patches.\n"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm-ascend/tools/itl20/wy_solve_310p/CMakeLists.txt b/vllm-ascend/tools/itl20/wy_solve_310p/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/wy_solve_310p/CMakeLists.txt
+@@ -0,0 +1,5 @@
++cmake_minimum_required(VERSION 3.20)
++project(WySolve LANGUAGES CXX)
++find_package(ASC REQUIRED PATHS "$ENV{ASCEND_HOME_PATH}/compiler/tikcpp/ascendc_kernel_cmake")
++enable_language(ASC)
++ascendc_library(wy_solve_kernel SHARED wy_solve.cpp)
+diff --git a/vllm-ascend/tools/itl20/wy_solve_310p/build_extension.py b/vllm-ascend/tools/itl20/wy_solve_310p/build_extension.py
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/wy_solve_310p/build_extension.py
+@@ -0,0 +1,33 @@
++import os
++import shutil
++from pathlib import Path
++
++import torch_npu
++from torch.utils.cpp_extension import load
++
++root = Path(__file__).resolve().parent
++npu = Path(torch_npu.__file__).resolve().parent
++(root / "build_torch").mkdir(exist_ok=True)
++shutil.copy2(
++    root / "build/libwy_solve_kernel.so", root / "build_torch/libwy_solve_kernel.so"
++)
++path = load(
++    name="wy_solve_bindings",
++    sources=[str(root / "register.cpp")],
++    extra_include_paths=[
++        str(npu / "include"),
++        os.environ["ASCEND_HOME_PATH"] + "/include",
++    ],
++    extra_ldflags=[
++        "-L" + str(root / "build"),
++        "-lwy_solve_kernel",
++        "-Wl,-rpath,'$$ORIGIN'",
++        "-L" + str(npu / "lib"),
++        "-ltorch_npu",
++    ],
++    extra_cflags=["-O2"],
++    build_directory=str(root / "build_torch"),
++    is_python_module=False,
++    verbose=True,
++)
++print("BUILT", path)
+diff --git a/vllm-ascend/tools/itl20/wy_solve_310p/register.cpp b/vllm-ascend/tools/itl20/wy_solve_310p/register.cpp
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/wy_solve_310p/register.cpp
+@@ -0,0 +1,35 @@
++#include <ATen/ATen.h>
++#include <torch/library.h>
++#include <torch_npu/csrc/core/npu/NPUStream.h>
++#include <torch_npu/csrc/framework/OpCommand.h>
++
++extern "C" void launch_wy_solve(void *, void *, uint32_t, void *);
++
++at::Tensor wy_solve(const at::Tensor &input) {
++    TORCH_CHECK(input.scalar_type() == at::kFloat, "WY solve requires float32");
++    TORCH_CHECK(input.dim() >= 2 && input.size(-1) == 64 && input.size(-2) == 64,
++                "WY solve requires [..., 64, 64]");
++    TORCH_CHECK(input.is_contiguous(), "WY solve requires contiguous input");
++    auto output = at::empty_like(input);
++    const uint32_t count = input.numel() / (64 * 64);
++    if (count == 0) return output;
++    void *stream = c10_npu::getCurrentNPUStream().stream();
++    at_npu::native::OpCommand command;
++    command.Name("WySolve310p");
++    command.SetCustomHandler([input, output, count, stream]() -> int {
++        launch_wy_solve(input.data_ptr(), output.data_ptr(), count, stream);
++        return 0;
++    });
++    command.Run();
++    return output;
++}
++
++TORCH_LIBRARY(vllm_ascend_perf, m) {
++    m.def("wy_solve(Tensor input) -> Tensor");
++}
++TORCH_LIBRARY_IMPL(vllm_ascend_perf, PrivateUse1, m) {
++    m.impl("wy_solve", &wy_solve);
++}
++TORCH_LIBRARY_IMPL(vllm_ascend_perf, Meta, m) {
++    m.impl("wy_solve", [](const at::Tensor &input) { return at::empty_like(input); });
++}
+diff --git a/vllm-ascend/tools/itl20/wy_solve_310p/test_kernel.py b/vllm-ascend/tools/itl20/wy_solve_310p/test_kernel.py
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/wy_solve_310p/test_kernel.py
+@@ -0,0 +1,48 @@
++import json
++import time
++from pathlib import Path
++
++import torch
++import torch_npu
++import vllm_ascend  # noqa: F401 - register the same NPU operators as the serving process
++
++torch.set_num_threads(1)
++torch.npu.set_device(0)
++torch_npu.npu.set_compile_mode(jit_compile=False)
++root = Path(__file__).resolve().parent
++torch.ops.load_library(str(root / "build_torch/wy_solve_bindings.so"))
++results = []
++for n, kind in [
++    (1, "random"),
++    (12, "random"),
++    (1536, "random"),
++    (12, "zero"),
++    (12, "collinear"),
++]:
++    torch.manual_seed(42)
++    a = (torch.randn(n, 64, 64) * 0.03).tril(-1)
++    if kind == "zero":
++        a.zero_()
++    if kind == "collinear":
++        a = -torch.ones_like(a).tril(-1)
++    eye = torch.eye(64).expand(n, 64, 64).contiguous()
++    ref = torch.linalg.solve_triangular(
++        (eye - a).double(), eye.double(), upper=False, unitriangular=True
++    ).float()
++    aa = a.npu()
++    out = torch.ops.vllm_ascend_perf.wy_solve(aa)
++    torch.npu.synchronize()
++    error = float((out.cpu() - ref).abs().max())
++    torch.testing.assert_close(out.cpu(), ref, atol=2e-6, rtol=2e-5)
++    torch.testing.assert_close(aa.cpu(), a)
++    times = []
++    for _ in range(3):
++        t = time.perf_counter()
++        out = torch.ops.vllm_ascend_perf.wy_solve(aa)
++        torch.npu.synchronize()
++        times.append((time.perf_counter() - t) * 1000)
++    row = {"matrices": n, "kind": kind, "max_abs_error": error, "time_ms": times}
++    results.append(row)
++    print(row, flush=True)
++(root / "kernel_test.json").write_text(json.dumps(results, indent=2))
++print("ALL_KERNEL_TESTS_PASSED", flush=True)
+diff --git a/vllm-ascend/tools/itl20/wy_solve_310p/wy_solve.cpp b/vllm-ascend/tools/itl20/wy_solve_310p/wy_solve.cpp
+new file mode 100644
+--- /dev/null
++++ b/vllm-ascend/tools/itl20/wy_solve_310p/wy_solve.cpp
+@@ -0,0 +1,87 @@
++#include "kernel_operator.h"
++
++using namespace AscendC;
++constexpr uint32_t kChunk = 64;
++constexpr uint32_t kElements = kChunk * kChunk;
++constexpr uint32_t kCores = 8;
++
++class WySolve {
++public:
++    __aicore__ inline void Init(GM_ADDR input, GM_ADDR output, uint32_t count) {
++        count_ = count;
++        input_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(input), count * kElements);
++        output_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(output), count * kElements);
++        pipe_.InitBuffer(matrix_, kElements * sizeof(float));
++        pipe_.InitBuffer(transposed_, kElements * sizeof(float));
++        pipe_.InitBuffer(scratch_, kElements * sizeof(float));
++        pipe_.InitBuffer(transposeOffsets_, kElements * sizeof(uint32_t));
++        pipe_.InitBuffer(columnOffsets_, kChunk * sizeof(uint32_t));
++        pipe_.InitBuffer(sums_, kChunk * 8 * sizeof(float));
++        pipe_.InitBuffer(row_, kChunk * sizeof(float));
++    }
++    __aicore__ inline void Process() {
++        auto matrix = matrix_.Get<float>();
++        auto transposed = transposed_.Get<float>();
++        auto scratch = scratch_.Get<float>();
++        auto transposeOffsets = transposeOffsets_.Get<uint32_t>();
++        auto columnOffsets = columnOffsets_.Get<uint32_t>();
++        auto sums = sums_.Get<float>();
++        auto resultRow = row_.Get<float>();
++        for (uint32_t i = 0; i < kChunk; ++i) {
++            columnOffsets.SetValue(i, i * kChunk * sizeof(float));
++            for (uint32_t j = 0; j < kChunk; ++j) {
++                transposeOffsets.SetValue(i * kChunk + j, (j * kChunk + i) * sizeof(float));
++            }
++        }
++        Sync<HardEvent::S_V>();
++        for (uint32_t index = GetBlockIdx(); index < count_; index += GetBlockNum()) {
++            const uint32_t offset = index * kElements;
++            DataCopy(matrix, input_[offset], kElements);
++            Sync<HardEvent::MTE2_V>();
++            Gather(transposed, matrix, transposeOffsets, 0, kElements);
++            PipeBarrier<PIPE_V>();
++            for (uint32_t row = 1; row < kChunk; ++row) {
++                // T[j,k] = B[k,j]; the original A[i,:] is broadcast across j.
++                Mul(scratch, transposed, matrix[row * kChunk], uint64_t(kChunk), uint8_t(kChunk),
++                    {1, 1, 1, 8, 8, 0});
++                PipeBarrier<PIPE_V>();
++                WholeReduceSum(sums, scratch, kChunk, kChunk, 1, 1, 8);
++                PipeBarrier<PIPE_V>();
++                Add(resultRow, matrix[row * kChunk], sums, kChunk);
++                PipeBarrier<PIPE_V>();
++                Scatter(transposed, resultRow, columnOffsets, row * sizeof(float), kChunk);
++                PipeBarrier<PIPE_V>();
++            }
++            Sync<HardEvent::V_S>();
++            for (uint32_t i = 0; i < kChunk; ++i) {
++                transposed.SetValue(i * kChunk + i, 1.0f);
++            }
++            Sync<HardEvent::S_V>();
++            Gather(matrix, transposed, transposeOffsets, 0, kElements);
++            Sync<HardEvent::V_MTE3>();
++            DataCopy(output_[offset], matrix, kElements);
++            Sync<HardEvent::MTE3_S>();
++        }
++    }
++private:
++    template <HardEvent kind> __aicore__ inline void Sync() {
++        const event_t event = static_cast<event_t>(pipe_.FetchEventID(kind));
++        SetFlag<kind>(event);
++        WaitFlag<kind>(event);
++    }
++    TPipe pipe_;
++    TBuf<TPosition::VECCALC> matrix_, transposed_, scratch_, transposeOffsets_, columnOffsets_, sums_, row_;
++    GlobalTensor<float> input_, output_;
++    uint32_t count_;
++};
++
++extern "C" __global__ __aicore__ void wy_solve_kernel(GM_ADDR input, GM_ADDR output, uint32_t count) {
++    WySolve op;
++    op.Init(input, output, count);
++    op.Process();
++}
++
++extern "C" void launch_wy_solve(void *input, void *output, uint32_t count, void *stream) {
++    const uint32_t blocks = count < kCores ? count : kCores;
++    wy_solve_kernel<<<blocks, nullptr, stream>>>((GM_ADDR)input, (GM_ADDR)output, count);
++}
+diff --git a/vllm-ascend/vllm_ascend/_310p/model_runner_310p.py b/vllm-ascend/vllm_ascend/_310p/model_runner_310p.py
+--- a/vllm-ascend/vllm_ascend/_310p/model_runner_310p.py
++++ b/vllm-ascend/vllm_ascend/_310p/model_runner_310p.py
+@@ -50,6 +50,7 @@
+ from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
+ from vllm_ascend._310p.sample.sampler import AscendSampler310
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.compilation.acl_graph import get_graph_params
+ from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+ from vllm_ascend.spec_decode.utils import (
+     update_num_computed_tokens_for_batch_change,
+@@ -310,28 +311,85 @@
+         )
+ 
+         if need_async_num_computed_update:
+-            self.prev_positions.copy_to_gpu(num_reqs)
+-            self.prev_num_draft_tokens.copy_to_gpu()
+-            cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+-                device=self.device, non_blocking=True
+-            )
+-            update_num_computed_tokens_for_batch_change(
+-                self.num_computed_tokens,
+-                self.num_accepted_tokens.gpu[:num_reqs],
+-                self.prev_positions.gpu[:num_reqs],
+-                self.valid_sampled_token_count_gpu,
+-                self.prev_num_draft_tokens.gpu,
+-                cpu_values,
+-            )
+-            # Make sure D2H is synchronized.
+-            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
+-                self.num_computed_tokens[:num_reqs], non_blocking=False
+-            )
++            # Fast path (zcode): steady single-request spec decode. The GPU
++            # correction chain below is enqueued on the main stream AFTER the
++            # draft ACL-graph replay, and its closing D2H is a blocking copy,
++            # so the host stalls for the whole draft before it can build the
++            # verify batch. For one continuing request the correction is
++            # arithmetic on the emitted-token count already event-synced into
++            # num_accepted_tokens.np above:
++            #   corrected = prev_corrected + emitted_prev
++            # which is exactly update_num_computed_tokens_for_batch_change
++            # for a participating row (prev_positions[0] == 0, prev drafts >
++            # 0). The GPU mirror is refreshed with an async pinned H2D (the
++            # same pattern as the else branch) that stays ordered before
++            # later GPU readers (e.g. the seq_lens build) without blocking
++            # the host.
++            _mirror = getattr(self, "_nct_corrected_mirror", None)  # list[int] per row
++            _mirror_n = getattr(self, "_nct_mirror_rows", 0)
++            prev_pos_ok = (
++                num_reqs > 0
++                and (self.prev_positions.np[:num_reqs] == np.arange(num_reqs)).all()
++                and (self.prev_num_draft_tokens.np[:num_reqs] > 0).all()
++            )
++            steady = (
++                _mirror is not None
++                and _mirror_n == num_reqs
++                and self.num_accepted_tokens_event is not None
++                and prev_pos_ok
++            )
++            if steady:
++                if num_reqs == 1:
++                    corrected = _mirror[0] + int(self.num_accepted_tokens.np[0])
++                    self.input_batch.num_computed_tokens_cpu_tensor[:1] = corrected
++                    self.num_computed_tokens[:1].copy_(
++                        self.input_batch.num_computed_tokens_cpu_tensor[:1],
++                        non_blocking=True,
++                    )
++                    self._nct_corrected_mirror = [corrected]
++                else:
++                    acc = self.num_accepted_tokens.np[:num_reqs]
++                    corrected_vec = [int(_mirror[i]) + int(acc[i]) for i in range(num_reqs)]
++                    cct = self.input_batch.num_computed_tokens_cpu_tensor
++                    for i, v in enumerate(corrected_vec):
++                        cct[i] = v
++                    self.num_computed_tokens[:num_reqs].copy_(cct[:num_reqs], non_blocking=True)
++                    self._nct_corrected_mirror = corrected_vec
++            else:
++                self.prev_positions.copy_to_gpu(num_reqs)
++                self.prev_num_draft_tokens.copy_to_gpu()
++                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
++                    device=self.device, non_blocking=True
++                )
++                update_num_computed_tokens_for_batch_change(
++                    self.num_computed_tokens,
++                    self.num_accepted_tokens.gpu[:num_reqs],
++                    self.prev_positions.gpu[:num_reqs],
++                    self.valid_sampled_token_count_gpu,
++                    self.prev_num_draft_tokens.gpu,
++                    cpu_values,
++                )
++                # Make sure D2H is synchronized.
++                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
++                    self.num_computed_tokens[:num_reqs], non_blocking=False
++                )
++                # Keep the CPU mirror of num_computed_tokens[:num_reqs] for
++                # the fast path (rows were just corrected by the chain above).
++                self._nct_corrected_mirror = [
++                    int(self.input_batch.num_computed_tokens_cpu_tensor[i]) for i in range(num_reqs)
++                ]
++                self._nct_mirror_rows = num_reqs
+         else:
+             self.num_computed_tokens[:num_reqs].copy_(
+                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                 non_blocking=True,
+             )
++            # CPU value is authoritative in this branch (prefill / first spec
++            # step); mirror it for the fast path.
++            self._nct_corrected_mirror = [
++                int(self.input_batch.num_computed_tokens_cpu_tensor[i]) for i in range(num_reqs)
++            ]
++            self._nct_mirror_rows = num_reqs
+         # Make sure when you update the positions and slot mapping, num_computed_tokens_cpu
+         # has been corrected.
+         positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
+@@ -639,12 +697,18 @@
+             **model_kwargs,
+         }
+         run_model = partial(self.model, **model_inputs)
++        graph_params = get_graph_params()
+         update_before_replay = (
+             self.speculative_config is not None
+             and not self.enable_enpu
+             and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+             and not forward_context.capturing
+             and hasattr(self, "update_stream")
++            # Native 310P ATB graphs read refreshed buffers directly and do
++            # not register graph-task handles. Only real task updates need
++            # the host barrier below.
++            and graph_params is not None
++            and bool(graph_params.handles.get(num_tokens_padded))
+         )
+ 
+         if self.enable_enpu or update_before_replay:
+diff --git a/vllm-ascend/vllm_ascend/_310p/ops/fla/chunk_gated_delta_rule.py b/vllm-ascend/vllm_ascend/_310p/ops/fla/chunk_gated_delta_rule.py
+--- a/vllm-ascend/vllm_ascend/_310p/ops/fla/chunk_gated_delta_rule.py
++++ b/vllm-ascend/vllm_ascend/_310p/ops/fla/chunk_gated_delta_rule.py
+@@ -16,6 +16,8 @@
+ # mypy: ignore-errors
+ 
+ from __future__ import annotations
++
++from pathlib import Path
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -342,22 +344,35 @@
+     g = g.reshape(batch_size, num_v_heads, num_chunks, chunk_size).cumsum(dim=-1)
+     beta = beta.reshape(batch_size, num_v_heads, num_chunks, chunk_size)
+ 
+-    lower_decay = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float().tril()
++    # Fast path (zcode): fold the within-chunk decay into the matmul
++    # operands instead of materializing (g_i - g_j) [*,cs,cs] and applying
++    # tril/exp/tril + elementwise-multiply (~250MB traffic per layer).
++    # Only the strictly-lower part of attn survives the masked_fill below,
++    # so the factored form exp(g_i)*exp(-g_j) is exact for every surviving
++    # entry; the diagonal/upper entries are discarded either way.
+     k_beta = key * beta.unsqueeze(-1)
+-    attn = -(k_beta @ key.transpose(-1, -2) * lower_decay)
++    k_beta_decay = k_beta * g.unsqueeze(-1).exp()
++    key_g = key * (-g).unsqueeze(-1).exp()
++    attn = -(k_beta_decay @ key_g.transpose(-1, -2))
+     mask_diag = torch.triu(
+         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=k.device),
+         diagonal=0,
+     )
+     attn = attn.masked_fill(mask_diag, 0)
+-    for row_idx in range(1, chunk_size):
+-        row = attn[..., row_idx, :row_idx].clone()
+-        sub = attn[..., :row_idx, :row_idx].clone()
+-        attn[..., row_idx, :row_idx] = row + (row.unsqueeze(-1) * sub).sum(-2)
+-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
++    if attn.device.type == "npu" and chunk_size == CHUNK_SIZE:
++        if not hasattr(torch.ops.vllm_ascend_perf, "wy_solve"):
++            library = Path(__file__).resolve().parents[3] / "_wy_solve" / "wy_solve_bindings.so"
++            torch.ops.load_library(str(library))
++        attn = torch.ops.vllm_ascend_perf.wy_solve(attn)
++    else:
++        for row_idx in range(1, chunk_size):
++            row = attn[..., row_idx, :row_idx].clone()
++            sub = attn[..., :row_idx, :row_idx].clone()
++            attn[..., row_idx, :row_idx] = row + (row.unsqueeze(-1) * sub).sum(-2)
++        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+ 
+     value = attn @ (value * beta.unsqueeze(-1))
+-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
++    k_cumdecay = attn @ k_beta_decay
+ 
+     u_kernel = value.reshape(batch_size, num_v_heads, padded_tokens, value_dim).to(torch.float16).contiguous()
+     w_kernel = k_cumdecay.reshape(batch_size, num_v_heads, padded_tokens, k_dim).to(torch.float16).contiguous()
+diff --git a/vllm-ascend/vllm_ascend/_310p/ops/fla/gdn_310.py b/vllm-ascend/vllm_ascend/_310p/ops/fla/gdn_310.py
+--- a/vllm-ascend/vllm_ascend/_310p/ops/fla/gdn_310.py
++++ b/vllm-ascend/vllm_ascend/_310p/ops/fla/gdn_310.py
+@@ -63,29 +63,23 @@
+     if ssm_state_indices.ndim == 1:
+         return ssm_state_indices[:total_tokens].to(torch.int32).contiguous()
+ 
+-    num_seqs = (cu_seqlens[1:] - cu_seqlens[:-1]).shape[0]
+-    seq_lens = cu_seqlens[1 : num_seqs + 1] - cu_seqlens[:num_seqs]
++    num_seqs = cu_seqlens.numel() - 1
+     ssm_state_indices = ssm_state_indices[:num_seqs]
+ 
+     # Uniform spec-decode ACL graph uses fixed q_len per request; reshape avoids
+     # NPU masked_select which breaks stream capture (aclnnMaskedSelect / 107027).
+-    if _EXTRA_CTX.capturing or (seq_lens.numel() > 0 and torch.all(seq_lens == seq_lens[0])):
++    if _EXTRA_CTX.capturing:
+         q_per_seq = ssm_state_indices.shape[1]
+         flat = ssm_state_indices[:, :q_per_seq].reshape(-1)
+         return flat[:total_tokens].to(torch.int32).contiguous()
+ 
+-    # Eager mixed batches with variable seq_lens: compact on CPU, copy back async.
+-    ssm_cpu = ssm_state_indices.cpu()
+-    seq_lens_cpu = seq_lens.cpu()
+-    q_per_seq = ssm_cpu.shape[1]
+-    positions = torch.arange(q_per_seq)
+-    valid = positions.unsqueeze(0) < seq_lens_cpu.unsqueeze(1)
+-    flat_cpu = ssm_cpu.masked_select(valid).to(torch.int32).contiguous()[:total_tokens]
+-    if not flat_cpu.is_pinned:
+-        flat_cpu = flat_cpu.pin_memory()
+-    flat_dev = torch.empty(flat_cpu.numel(), dtype=torch.int32, device=ssm_state_indices.device)
+-    flat_dev.copy_(flat_cpu, non_blocking=True)
+-    return flat_dev.contiguous()
++    # Eager tokens are unpadded. Map each token to its state slot on device,
++    # including zero-length requests, without a scalar test or a D2H copy.
++    positions = torch.arange(total_tokens, dtype=torch.int32, device=ssm_state_indices.device)
++    sequence_ids = (positions[:, None] >= cu_seqlens[None, 1:]).sum(1).to(torch.int32)
++    starts = cu_seqlens.index_select(0, sequence_ids)
++    offsets = sequence_ids * ssm_state_indices.shape[1] + positions - starts
++    return ssm_state_indices.reshape(-1).index_select(0, offsets).to(torch.int32).contiguous()
+ 
+ 
+ def _mask_padded_recurrent_accepted_tokens(
+@@ -352,7 +346,7 @@
+             # 2.2: Process the remaining part
+             if attn_metadata.num_prefills > 0:
+                 initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+-                initial_state[~has_initial_state, ...] = 0
++                initial_state.masked_fill_(~has_initial_state[:, None, None, None], 0)
+                 (
+                     core_attn_out_non_spec,
+                     last_recurrent_state,
+@@ -364,7 +358,11 @@
+                     beta=beta_non_spec,
+                     initial_state=initial_state,
+                     output_final_state=True,
+-                    cu_seqlens=non_spec_query_start_loc,
++                    cu_seqlens=(
++                        torch.tensor(attn_metadata.non_spec_prefill_metadata.chunk.cu_seqlens_host, dtype=torch.int64)
++                        if attn_metadata.num_decodes == 0
++                        else non_spec_query_start_loc
++                    ),
+                     head_first=False,
+                     use_qk_l2norm_in_kernel=True,
+                 )
+diff --git a/vllm-ascend/vllm_ascend/_310p/quantization/modelslim_config.py b/vllm-ascend/vllm_ascend/_310p/quantization/modelslim_config.py
+--- a/vllm-ascend/vllm_ascend/_310p/quantization/modelslim_config.py
++++ b/vllm-ascend/vllm_ascend/_310p/quantization/modelslim_config.py
+@@ -135,6 +135,22 @@
+         elif isinstance(layer, VocabParallelEmbedding):
+             from vllm_ascend._310p.ops.vocab_parallel_embedding import AscendUnquantizedEmbeddingMethod310
+ 
++            # Fast path (zcode): honor a quantized declaration (e.g. a
++            # ModelSlim-quantized lm_head). Without this, lm_head is forced
++            # to unquantized FP16 regardless of quant_model_description.json,
++            # which costs a full FP16 vocab matmul read per decode step.
++            packed = getattr(self, "packed_modules_mapping", {})
++            if not self.is_layer_skipped_ascend(prefix, packed):
++                scheme = create_scheme_for_layer(
++                    quant_description=self.quant_description,
++                    prefix=prefix,
++                    layer_type="linear",
++                    packed_modules_mapping=packed,
++                )
++                logger.debug(
++                    "Select AscendLinearMethod (quantized embedding) for %s (layer=VocabParallelEmbedding)", prefix
++                )
++                return AscendLinearMethod(scheme)
+             logger.debug(
+                 "Select AscendUnquantizedEmbeddingMethod310 for %s (layer=%s)", prefix, "VocabParallelEmbedding"
+             )
+diff --git a/vllm-ascend/vllm_ascend/sample/rejection_sampler.py b/vllm-ascend/vllm_ascend/sample/rejection_sampler.py
+--- a/vllm-ascend/vllm_ascend/sample/rejection_sampler.py
++++ b/vllm-ascend/vllm_ascend/sample/rejection_sampler.py
+@@ -1065,6 +1065,75 @@
+     batch_size = output_token_ids.size(0)
+     num_tokens = draft_token_ids.size(0)
+     device = output_token_ids.device
++
++    # Fast path (zcode, any batch): N greedy requests, each with a uniform
++    # full-length draft (K tokens per row). Vectorized version of the general
++    # path below: no boolean indexing (NonzeroV2 host syncs), no index_put
++    # chains, no repeat_interleave implicit .item() sync, and no pageable-H2D
++    # `torch.tensor(list).to(device)` that queues behind the in-flight verify
++    # graph and blocks the launching thread for the whole verify duration.
++    # Same math as the general greedy path, evaluated per row.
++    if (
++        is_greedy is None
++        and not synthetic_mode
++        and batch_size >= 1
++        and num_tokens == batch_size * max_spec_len
++        and all(d == max_spec_len for d in draft_tokens_per_req)
++    ):
++        B, K = batch_size, max_spec_len
++        mm = (draft_token_ids != target_argmax).view(B, K)
++        # first mismatch per row via float argmax (int64 argmin has no 310P
++        # kernel); D when no mismatch.
++        first_m = torch.where(
++            mm.any(dim=1), torch.argmax(mm.to(torch.float32), dim=1), K
++        )  # [B]
++        copy_len = torch.clamp(first_m + 1, max=K)  # [B]
++        out = output_token_ids  # [B, K+1]
++        out[:, :K] = target_argmax.view(B, K)
++        cols = torch.arange(K + 1, device=device)
++        valid = cols.unsqueeze(0) < copy_len.unsqueeze(1)  # [B, K+1]
++        out.masked_fill_(~valid, PLACEHOLDER_TOKEN_ID)
++        needs_bonus = first_m >= K  # [B]
++        bonus = bonus_token_ids.reshape(-1).to(out.dtype)  # [B]
++        out[:, K] = torch.where(needs_bonus, bonus, out[:, K])
++        return
++
++    # Fast path (zcode): single greedy request with a full-length draft.
++    # The general path below relies on boolean indexing (each index/index_put
++    # with a bool mask lowers to NonzeroV2, which syncs the NPU stream to read
++    # the output shape back to host), repeat_interleave (implicit .item()
++    # sync), and a pageable-H2D `torch.tensor(list).to(device)` that queues
++    # behind the in-flight verify graph and blocks the launching thread for
++    # the whole verify duration. This path is pure device ops with statically
++    # known shapes: no stream syncs, no host round trips, bit-identical
++    # results to the general greedy path for batch_size == 1.
++    if (
++        batch_size == 1
++        and is_greedy is None
++        and not synthetic_mode
++        and num_tokens == output_token_ids.size(1) - 1
++        and list(draft_tokens_per_req) == [num_tokens]
++    ):
++        n = num_tokens
++        out_row = output_token_ids[0]
++        mismatch = draft_token_ids != target_argmax  # [n] bool
++        # First mismatch index via float argmax: int64 min/argmin lowers to
++        # ArgMinWithValue, which has no 310P kernel for int64.
++        first_mismatch = torch.where(
++            mismatch.any(),
++            torch.argmax(mismatch.to(torch.float32)),
++            n,
++        )  # 0-dim int64
++        copy_len = torch.clamp(first_mismatch + 1, max=n)
++        out_cols = torch.arange(n + 1, device=device)
++        valid = out_cols < copy_len
++        out_row[:n].copy_(target_argmax)
++        out_row.masked_fill_(~valid, PLACEHOLDER_TOKEN_ID)
++        needs_bonus = first_mismatch >= n
++        bonus = bonus_token_ids.reshape(-1)[0].to(output_token_ids.dtype)
++        out_row[n].copy_(torch.where(needs_bonus, bonus, out_row[n]))
++        return
++
+     draft_tokens_per_req = torch.tensor(draft_tokens_per_req).to(device, non_blocking=True)
+     if is_greedy is None:
+         is_greedy = torch.ones(batch_size, dtype=torch.bool, device=device)
+diff --git a/vllm-ascend/vllm_ascend/worker/model_runner_v1.py b/vllm-ascend/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm-ascend/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm-ascend/vllm_ascend/worker/model_runner_v1.py
+@@ -807,11 +807,19 @@
+             return
+ 
+         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+-        self.input_batch.prev_sampled_token_ids = torch.tensor(
+-            prev_sampled_token_ids,
+-            dtype=torch.int32,
+-            device=self.device,
+-        ).unsqueeze(1)
++        # Fast path (zcode): torch.tensor(list, device=npu) performs a pageable
++        # H2D that blocks the host until the whole stream drains (~one engine
++        # step each call). Stage through a persistent pinned buffer and issue
++        # a truly async H2D instead.
++        n_prev = len(prev_sampled_token_ids)
++        pin = getattr(self, "_prev_sampled_pin_buf", None)
++        if pin is None or pin.shape[0] < n_prev:
++            pin = torch.empty(max(n_prev, 16), dtype=torch.int32, pin_memory=True)
++            self._prev_sampled_pin_buf = pin
++        pin[:n_prev].copy_(torch.tensor(prev_sampled_token_ids, dtype=torch.int32))
++        self.input_batch.prev_sampled_token_ids = (
++            pin[:n_prev].to(self.device, non_blocking=True).unsqueeze(1)
++        )
+ 
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
+         # Temporary rewind guard for KV-load-failure recompute.
+@@ -1489,6 +1497,10 @@
+         metadata build and the early draft forward instead of synchronizing in
+         the proposer.
+         """
++        # Only parallel drafting consumes this CPU mirror. Sequential MTP
++        # keeps reject counts on device; a D2H here needlessly drains its stream.
++        if not self.speculative_config.parallel_drafting:
++            return
+         event = self.num_rejected_tokens_event
+         copy_stream = self.num_rejected_tokens_copy_stream
+         counts_cpu = self.num_rejected_tokens_cpu

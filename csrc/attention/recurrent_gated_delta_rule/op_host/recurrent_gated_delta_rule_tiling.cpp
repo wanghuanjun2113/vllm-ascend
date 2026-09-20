@@ -42,6 +42,7 @@ const size_t BETA_DIM_NUM = 2;
 const size_t STATE_DIM_NUM = 4;
 const size_t CUSEQLENS_DIM_NUM = 1;
 const size_t SSM_STATE_INDICES_DIM_NUM = 1;
+const size_t SSM_STATE_INDICES_FIXED_DIM_NUM = 2;
 const size_t G_DIM_NUM = 2;
 
 const size_t DIM_0 = 0;
@@ -267,10 +268,19 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::CheckShapeDimAndRelation(const ge
     if (!CheckDim(queryShape, QKV_DIM_NUM, "query") || !CheckDim(keyShape, QKV_DIM_NUM, "key") ||
         !CheckDim(valueShape, QKV_DIM_NUM, "value") || !CheckDim(betaShape, BETA_DIM_NUM, "beta") ||
         !CheckDim(stateShape, STATE_DIM_NUM, "state") ||
-        !CheckDim(cuSeqlensShape, CUSEQLENS_DIM_NUM, "actual_seq_lengths") ||
-        !CheckDim(ssmStateShape, SSM_STATE_INDICES_DIM_NUM, "ssm_state_indices")) {
+        !CheckDim(cuSeqlensShape, CUSEQLENS_DIM_NUM, "actual_seq_lengths")) {
         return ge::GRAPH_FAILED;
     }
+
+    const bool fixedStateRows = ssmStateShape.GetDimNum() == SSM_STATE_INDICES_FIXED_DIM_NUM;
+    if (!fixedStateRows && !CheckDim(ssmStateShape, SSM_STATE_INDICES_DIM_NUM, "ssm_state_indices")) {
+        return ge::GRAPH_FAILED;
+    }
+    OP_CHECK_IF(fixedStateRows && (ssmStateShape.GetDim(DIM_0) != cuSeqlensShape.GetDim(DIM_0) - 1 ||
+                                   ssmStateShape.GetDim(DIM_1) <= 0),
+                OP_LOGE(inputParams_.opName, "2D ssm_state_indices must have shape [B, S] with S > 0"),
+                return ge::GRAPH_FAILED);
+    tilingData_.stateIndexStride = fixedStateRows ? ssmStateShape.GetDim(DIM_1) : 0;
 
     if (!CheckDimEqual(queryShape, DIM_0, keyShape, DIM_0, "query", "key", "T dimension") ||
         !CheckDimEqual(queryShape, DIM_1, keyShape, DIM_1, "query", "key", "Nk dimension") ||

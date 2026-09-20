@@ -56,6 +56,7 @@ public:
     __aicore__ inline RGDR(const RecurrentGatedDeltaRuleTilingData *tilingData)
     {
         B_ = tilingData->b;
+        stateIndexStride_ = tilingData->stateIndexStride;
         T_ = tilingData->t;
         NK_ = tilingData->nk;
         realK_ = tilingData->dk;
@@ -162,7 +163,8 @@ public:
             if (seqLen <= 0) {
                 continue;
             }
-            if (seqLen > static_cast<int32_t>(MAX_MTP)) {
+            const int32_t stateSlots = stateIndexStride_ == 0 ? seqLen : static_cast<int32_t>(stateIndexStride_);
+            if (seqLen > static_cast<int32_t>(MAX_MTP) || seqLen > stateSlots) {
                 return;
             }
             if (seq1 < 0 || seq1 > static_cast<int32_t>(T_) || (seq1 + seqLen) > static_cast<int32_t>(T_)) {
@@ -170,6 +172,7 @@ public:
             }
             int32_t seq0 = seq1;
             seq1 += seqLen;
+            uint64_t stateSeq0 = stateIndexStride_ == 0 ? seq0 : batch_i * stateIndexStride_;
             uint32_t copyFlag = 0;
             uint64_t stateOffset;
             for (uint64_t head_i = 0; head_i < NV_; head_i++) {
@@ -178,18 +181,18 @@ public:
                 }
                 copyFlag++;
                 if (copyFlag == 1) {
-                    int32_t stateTokenIdx = seq0;
+                    uint64_t stateTokenIdx = stateSeq0;
                     if (hasAcceptedTokens_) {
                         int32_t acceptedTokenNum = numAcceptedTokensGm_.GetValue(batch_i);
-                        if (acceptedTokenNum <= 0 || acceptedTokenNum > seqLen) {
+                        if (acceptedTokenNum <= 0 || acceptedTokenNum > stateSlots) {
                             return;
                         }
-                        stateTokenIdx = seq0 + acceptedTokenNum - 1;
+                        stateTokenIdx += acceptedTokenNum - 1;
                     }
                     stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
                     CopyInGamaBeta(seq0, seq1);
                 }
-                ProcessHead(seq0, seq1, head_i, stateOffset);
+                ProcessHead(seq0, seq1, head_i, stateOffset, stateSeq0);
             }
             if (hasGama_ && copyFlag != 0) {
                 gamaInQueue_.FreeTensor(gamaInUb);
@@ -439,7 +442,8 @@ private:
         }
     }
 
-    __aicore__ inline void ProcessHead(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset)
+    __aicore__ inline void ProcessHead(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset,
+                                       uint64_t stateSeq0)
     {
         uint64_t vOffset = (seq0 * NV_ + head_i) * realV_;
         uint64_t qkOffset = (seq0 * NK_ + head_i / (NV_ / NK_)) * realK_;
@@ -473,7 +477,7 @@ private:
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
                 uint64_t curStateOutOffset =
-                    ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
+                    ((ssmStateIndicesGm_.GetValue(stateSeq0 + seq_i - seq0) * NV_ + head_i) * realV_ + v_i) * realK_;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
@@ -554,6 +558,7 @@ private:
     LocalTensor<float> attnInUb;
     LocalTensor<float> stateInUb;
     uint32_t B_;
+    uint32_t stateIndexStride_;
     uint32_t T_;
     uint32_t NK_;
     uint32_t alignK_;

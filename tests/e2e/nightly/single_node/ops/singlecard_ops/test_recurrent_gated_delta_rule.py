@@ -14,6 +14,63 @@ np.random.seed(seed)
 torch.manual_seed(seed)
 
 
+@pytest.mark.parametrize(
+    "lengths,accepted",
+    [
+        ([4, 4], [1, 1]),
+        ([3, 4], [1, 1]),
+        ([4, 2, 4], [1, 1, 1]),
+        ([3, 0, 4], [1, 1, 1]),
+        ([3, 4], [4, 1]),
+    ],
+)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_recurrent_gated_delta_rule_fixed_state_rows(lengths, accepted, state_dtype):
+    """Short queries must not shift subsequent requests' state reads or writes."""
+    row_width = 4
+    num_tokens = sum(lengths)
+    num_key_heads, num_value_heads, head_dim = 4, 8, 128
+    state_indices = torch.arange(1, len(lengths) * row_width + 1, dtype=torch.int32).view(-1, row_width)
+    num_blocks = state_indices.numel() + 2
+    # Distinct block values expose both foreign writes and untouched stale slots.
+    state = (
+        torch.arange(num_blocks, dtype=state_dtype)
+        .view(-1, 1, 1, 1)
+        .expand(-1, num_value_heads, head_dim, head_dim)
+        .clone()
+    )
+    query = torch.zeros(num_tokens, num_key_heads, head_dim, dtype=torch.bfloat16)
+    query[..., 0] = 1
+    value = torch.zeros(num_tokens, num_value_heads, head_dim, dtype=torch.bfloat16)
+    expected_output = torch.empty_like(value)
+    expected_state = state.clone()
+    offset = 0
+    for row, (length, count) in enumerate(zip(lengths, accepted)):
+        current = state[state_indices[row, count - 1]].clone()
+        for token in range(length):
+            # q=k=e0, v=g=0, beta=0.5: only state column zero halves per token.
+            current[..., 0] *= 0.5
+            expected_output[offset + token] = current[..., 0]
+            expected_state[state_indices[row, token]] = current
+        offset += length
+
+    state_npu = state.npu()
+    output = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+        query=query.npu(),
+        key=query.npu(),
+        value=value.npu(),
+        state=state_npu,
+        beta=torch.full((num_tokens, num_value_heads), 0.5, dtype=torch.bfloat16).npu(),
+        g=torch.zeros(num_tokens, num_value_heads, dtype=torch.float32).npu(),
+        scale=1.0,
+        actual_seq_lengths=torch.tensor([0, *lengths], dtype=torch.int32).npu(),
+        ssm_state_indices=state_indices.npu(),
+        num_accepted_tokens=torch.tensor(accepted, dtype=torch.int32).npu(),
+    )
+    torch.testing.assert_close(output.cpu(), expected_output, rtol=3e-3, atol=1e-2)
+    torch.testing.assert_close(state_npu.cpu(), expected_state, rtol=3e-3, atol=1e-2)
+
+
 def golden_recurrent_gated_delta_rule(
     query,
     key,

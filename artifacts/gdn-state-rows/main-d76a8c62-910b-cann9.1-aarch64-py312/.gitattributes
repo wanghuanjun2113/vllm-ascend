@@ -1,0 +1,5 @@
+# Preserve the exact verified bytes of native and generated payload files.
+payload/** -text
+payload/**/*.so binary
+payload/**/*.o binary
+payload/*.run binary

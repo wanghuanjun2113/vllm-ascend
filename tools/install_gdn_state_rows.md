@@ -8,6 +8,12 @@
 保留目标源码仓库的当前分支，不会把 main 切换到 v0.25.1rc1。
 已经包含这个补丁的源码也可以运行，脚本会重新编译并验证。
 
+## 已编译产物
+
+[main d76a8c62 的 910B / CANN 9.1 / ARM64 / Python 3.12 产物](../artifacts/gdn-state-rows/main-d76a8c62-910b-cann9.1-aarch64-py312/README.md)
+已提供 `.so`、配套设备文件和完整 `.run` 包。
+这些二进制不适用于任意 v0.25.1rc1 环境；本脚本仍按下面的流程编译源码。
+
 ## 使用方法
 
 在运行 vLLM 的 **Linux Ascend 容器内** 执行，使用服务所用的 Python/venv。
